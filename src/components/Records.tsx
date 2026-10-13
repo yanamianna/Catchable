@@ -1,0 +1,45 @@
+import { formatTime } from '../api';
+import type { AppNotification, AppState, Booking } from '../types';
+import { Icon } from './Icon';
+import './verification-status.css';
+
+const bookingLabels: Record<Booking['status'], string> = { submitting: '正在提交', pending_restaurant: '请求已发送，等待餐厅确认', confirmed: '预约已确认', rejected: '未预订成功', outcome_unknown: '结果待核验', user_action_required: '需要你处理' };
+const notificationLabels: Record<AppNotification['status'], string> = { visible: '站内可见', queued: '等待投递', accepted: '通道已接收', failed: '投递失败' };
+
+export type BookingFilter = 'all' | 'confirmed' | 'pending' | 'pending_restaurant';
+export type NotificationFilter = 'all' | 'available' | 'attention';
+function BookingRecord({ booking, onTask }: { booking: Booking; onTask?: (id: string) => void }) {
+  const waitingRestaurant = booking.status === 'pending_restaurant';
+  const confirmed = booking.status === 'confirmed';
+  const pending = ['submitting', 'pending_restaurant', 'outcome_unknown', 'user_action_required'].includes(booking.status);
+  const step = confirmed ? 3 : waitingRestaurant ? 2 : booking.status === 'submitting' || booking.submitted === false ? 0 : 1;
+  const referenceLabel = waitingRestaurant ? '申请编号' : confirmed ? '预约确认编号' : '预约编号（待核验）';
+  return <article className="record-card"><div className="record-heading"><h3>{booking.restaurantName}</h3>{booking.source === 'demo' ? <span className="badge demo">演练 · 模拟结果</span> : null}<span className={`status status-${confirmed ? 'confirmed' : waitingRestaurant ? 'awaiting_confirmation' : booking.status === 'rejected' ? 'expired' : 'user_action_required'}`}><span />{bookingLabels[booking.status]}</span></div>
+    {booking.slot ? <p className="record-slot">{booking.slot.date} · {booking.slot.time} 韩国时间 · {booking.slot.partySize} 人</p> : null}
+    <p className="record-message">{booking.message ?? (waitingRestaurant ? '已找到对应申请，等待餐厅确认；当前还不是预约成功。' : '等待系统核验预订结果。')}</p>
+    {booking.reservationId ? <p className="record-reference">{booking.source === 'demo' ? '模拟' : ''}{referenceLabel}：{booking.reservationId}</p> : null}
+    {booking.status !== 'rejected' ? <div className="booking-progress" aria-label="预约状态进展">{['提交请求', '核验订单', '餐厅确认'].map((label, index) => <span key={label} className={index < step ? 'done' : index === step ? 'current' : ''}><i />{label}{confirmed && index === 2 ? '完成' : ''}</span>)}</div> : null}
+    {pending ? <div className="verification-box"><div className="verification-heading"><Icon name="clock" size={15} /><strong>{booking.nextVerificationAt ? '系统自动核验结果' : waitingRestaurant ? '等待餐厅确认' : booking.status === 'user_action_required' ? '需要你处理' : '预约结果待核验'}</strong></div><p>{waitingRestaurant ? '申请已发送。只有官方记录确认同一餐厅、日期、时间和人数后，才会显示预约已确认。' : '结果明确前会保留这笔记录，避免重复提交同条件预约。'}</p>{booking.lastVerificationMessage && booking.lastVerificationMessage !== booking.message ? <p className="verification-message">{booking.lastVerificationMessage}</p> : null}<div className="verification-meta">{typeof booking.verificationCount === 'number' ? <span>已核验 {booking.verificationCount} 次</span> : null}{booking.lastVerifiedAt ? <span>最近核验 {formatTime(booking.lastVerifiedAt)} 北京时间</span> : null}{booking.nextVerificationAt ? <span>下次核验 {formatTime(booking.nextVerificationAt)} 北京时间</span> : null}</div></div> : null}
+    <div className="record-footer"><time dateTime={booking.createdAt}>{formatTime(booking.createdAt, true)} 北京时间</time><div className="record-links">{onTask ? <button type="button" className="text-button" onClick={() => onTask(booking.taskId)}>查看对应任务</button> : null}{booking.source === 'live' ? <a className="text-button" href={booking.restaurantUrl} target="_blank" rel="noreferrer">查看官方餐厅页<Icon name="external" size={15} /></a> : <span>本地演练 · 未向餐厅提交预订</span>}</div></div>
+  </article>;
+}
+export function Bookings({ state, filter = 'all', onFilter, onTask }: { state: AppState | null; filter?: BookingFilter; onFilter?: (filter: BookingFilter) => void; onTask?: (id: string) => void }) {
+  const records = (state?.bookings ?? []).filter(record => filter === 'all' || record.source === 'live' && (filter === 'confirmed' ? record.status === 'confirmed' : filter === 'pending_restaurant' ? record.status === 'pending_restaurant' : ['submitting', 'pending_restaurant', 'outcome_unknown', 'user_action_required'].includes(record.status)));
+  return <section className="records-section"><div className="section-intro"><span className="eyebrow">MY DINING</span><h2>预约记录</h2><p>同条件匹配官方确认后，才会显示预约已确认。申请已发送和等待餐厅确认会单独记录。</p></div>
+    {onFilter ? <div className="filter-tabs record-filters" role="group" aria-label="预约记录筛选">{([{ id: 'all', label: '全部记录' }, { id: 'confirmed', label: '真实预约成功' }, { id: 'pending_restaurant', label: '等待餐厅确认' }, { id: 'pending', label: '待核验／处理' }] as const).map(item => <button type="button" key={item.id} className={filter === item.id ? 'selected' : ''} aria-pressed={filter === item.id} onClick={() => onFilter(item.id)}>{item.label}</button>)}</div> : null}
+    {records.length === 0 ? <div className="empty-state compact"><Icon name="record" size={34} /><h3>{filter === 'all' ? '期待第一笔预约' : '暂无符合条件的预约'}</h3><p>任务产生预订结果后，你可以在这里查看。</p>{filter !== 'all' && onFilter ? <button type="button" className="button" onClick={() => onFilter('all')}>查看全部记录</button> : null}</div> : <div className="records-list">{records.map(booking => <BookingRecord key={booking.id} booking={booking} onTask={onTask} />)}</div>}
+  </section>;
+}
+
+export function Notifications({ state, filter = 'all', onFilter, onTask }: { state: AppState | null; filter?: NotificationFilter; onFilter?: (filter: NotificationFilter) => void; onTask?: (id: string) => void }) {
+  const eventTypes = new Map(state?.events.map(event => [event.id, event.type]) ?? []);
+  const records = (state?.notifications ?? []).filter(record => {
+    const eventType = record.eventType ?? eventTypes.get(record.eventId ?? '');
+    return filter === 'all' || record.source === 'live' && (filter === 'available' ? record.channel === 'in_app' && eventType === 'slot_available' : ['auth_required', 'attention_required', 'booking_outcome_unknown', 'booking_user_action_required'].includes(eventType ?? '') || record.status === 'failed');
+  });
+  return <section className="records-section"><div className="section-intro"><span className="eyebrow">STAY IN THE LOOP</span><h2>通知中心</h2><p>查看每一条空位提醒与投递结果。通道接收不代表设备已读。</p></div>
+    {onFilter ? <div className="filter-tabs record-filters" role="group" aria-label="通知筛选">{([{ id: 'all', label: '全部通知' }, { id: 'available', label: '历史空位提醒' }, { id: 'attention', label: '需注意' }] as const).map(item => <button type="button" key={item.id} className={filter === item.id ? 'selected' : ''} aria-pressed={filter === item.id} onClick={() => onFilter(item.id)}>{item.label}</button>)}</div> : null}
+    {filter === 'available' ? <p className="records-explanation">这里显示发现时的历史记录。当前是否仍有空位，请在对应任务中重新检查。</p> : null}
+    {records.length === 0 ? <div className="empty-state compact"><Icon name="bell" size={34} /><h3>{filter === 'all' ? '好消息会出现在这里' : '暂无符合条件的通知'}</h3><p>发现符合条件的空位或需要你处理时，我们会留下提醒。</p>{filter !== 'all' && onFilter ? <button type="button" className="button" onClick={() => onFilter('all')}>查看全部通知</button> : null}</div> : <div className="records-list">{records.map(notification => <article className="notification-card" key={notification.id}><div className="notification-icon"><Icon name={notification.status === 'failed' ? 'info' : 'bell'} size={20} /></div><div className="notification-content"><div className="notification-meta"><span>{notification.channel === 'webhook' ? 'Webhook 通知' : '站内通知'}</span>{notification.source === 'demo' ? <span className="badge demo">演练</span> : null}<span className={`delivery-status delivery-${notification.status}`}>{notificationLabels[notification.status]}</span></div><p>{notification.message}</p>{notification.lastError ? <p className="form-error">{notification.lastError}</p> : null}<div className="notification-footer"><time dateTime={notification.createdAt}>{formatTime(notification.createdAt, true)} 北京时间</time>{notification.channel === 'webhook' ? <span>已尝试 {notification.attempts ?? 0} 次</span> : null}</div><div className="record-links">{notification.taskId && onTask ? <button type="button" className="text-button" onClick={() => onTask(notification.taskId!)}>查看对应任务</button> : null}{notification.restaurantUrl ? <a className="text-button" href={notification.restaurantUrl} target="_blank" rel="noreferrer">查看餐厅<Icon name="external" size={14} /></a> : null}</div></div></article>)}</div>}
+  </section>;
+}

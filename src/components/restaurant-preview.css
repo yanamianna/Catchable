@@ -1,0 +1,41 @@
+.restaurant-link-entry { display: flex; align-items: center; gap: 9px; margin-top: 8px; }
+.restaurant-link-entry > input { width: 100%; min-width: 0; border: 1px solid #dfe2e7; border-radius: 5px; padding: 9px 11px; height: 40px; font-size: 12px; color: #4f5866; background: #fff; }
+.restaurant-link-entry .button { font-size: 12px; padding: 9px 12px; min-height: 40px; }
+.restaurant-resolve-actions { display: flex; align-items: center; gap: 14px; margin-top: 9px; flex-wrap: wrap; }
+.restaurant-resolve-actions .text-button { font-size: 11px; padding: 3px 0; }
+.restaurant-resolve-error { color: #bb704e; font-size: 11px; font-weight: 400; line-height: 1.75; }
+.restaurant-manual-note { color: #a88657; font-size: 10px; font-weight: 400; margin-top: 8px; line-height: 1.8; }
+.restaurant-preview { border: 1px solid #e3ebe0; border-radius: 7px; padding: 15px; background: #fcfdfa; }
+.restaurant-preview-top { display: flex; gap: 12px; align-items: flex-start; }
+.restaurant-preview-image, .restaurant-preview-initial { width: 58px; height: 58px; border-radius: 6px; flex-shrink: 0; object-fit: cover; }
+.restaurant-preview-initial { display: grid; place-items: center; color: #a07650; font-size: 24px; background: #f9f1e8; }
+.restaurant-preview-heading { flex: 1; min-width: 0; }
+.restaurant-verified { color: #659451; font-size: 10px; display: inline-flex; align-items: center; gap: 4px; }
+.restaurant-preview-heading h3 { font-size: 17px; color: #343d32; font-weight: 630; margin-top: 5px; line-height: 1.5; overflow-wrap: anywhere; }
+.restaurant-preview-heading p { font-size: 11px; color: #87927f; margin-top: 5px; line-height: 1.7; }
+.restaurant-page-link { margin-left: auto; width: 27px; height: 27px; }
+.restaurant-description { font-size: 11px; color: #838d7d; line-height: 1.8; margin-top: 12px; }
+.restaurant-facts { margin-top: 9px; }
+.restaurant-facts p { font-size: 11px; color: #7f8a79; line-height: 1.8; margin-top: 5px; overflow-wrap: anywhere; }
+.restaurant-facts p > span { display: inline-block; color: #a0a899; margin-right: 8px; }
+.restaurant-notes { border-top: 1px solid #edf1e8; margin-top: 12px; padding-top: 10px; }
+.restaurant-notes summary { color: #809172; cursor: pointer; font-size: 11px; }
+.restaurant-notes summary > span { color: #a0a99a; margin-left: 7px; font-size: 10px; }
+.restaurant-notes ul { padding-left: 17px; margin: 10px 0 0; color: #8b9385; font-size: 10px; line-height: 1.9; }
+.restaurant-required { display: flex; align-items: flex-start; gap: 6px; font-size: 10px; color: #969f8e; line-height: 1.75; margin-top: 12px; }
+.restaurant-required svg { margin-top: 2px; }
+.task-prefill-summary { border: 1px solid #e8eaf0; background: #fafbfc; padding: 13px 14px; border-radius: 6px; margin-bottom: 21px; }
+.task-prefill-summary strong { display: block; font-size: 12px; color: #697586; font-weight: 580; }
+.task-prefill-summary p { font-size: 11px; color: #8993a2; line-height: 1.8; margin-top: 6px; }
+.task-mode-help { font-size: 10px; color: #989fac; font-weight: 400; line-height: 1.8; margin-top: 9px; }
+.task-advanced { margin-top: 20px; border-top: 1px solid #eceef2; padding-top: 14px; }
+.task-advanced summary { font-size: 12px; color: #8791a0; cursor: pointer; }
+.task-advanced summary span { font-size: 10px; color: #a5adb7; margin-left: 6px; }
+.task-advanced .form-grid { margin-top: 18px; }
+@media (max-width: 767px) {
+  .restaurant-link-entry { gap: 7px; }.restaurant-link-entry > input { padding-inline: 8px; font-size: 10px; }.restaurant-link-entry .button { font-size: 10px; padding-inline: 10px; }
+  .restaurant-preview { padding: 13px; }.restaurant-preview-top { gap: 10px; }.restaurant-preview-image, .restaurant-preview-initial { width: 44px; height: 44px; }.restaurant-preview-heading h3 { font-size: 14px; }.restaurant-preview-heading p { font-size: 10px; }.restaurant-preview-heading .restaurant-verified { font-size: 9px; }
+  .restaurant-resolve-actions { gap: 11px; }.restaurant-resolve-actions .text-button { font-size: 10px; }.task-prefill-summary { padding: 12px; }.task-prefill-summary p { font-size: 10px; }
+}
+.restaurant-description.collapsed { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; }
+.restaurant-description-button { font-size: 11px; color: #bb663a; }

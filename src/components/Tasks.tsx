@@ -1,0 +1,58 @@
+import { useState } from 'react';
+import { formatTime } from '../api';
+import type { AppState, Booking, Task, TaskStatus } from '../types';
+import { EmptyTable, Icon } from './Icon';
+import './verification-status.css';
+
+const statusLabels: Record<TaskStatus, string> = { paused: '已暂停', active: '监控中', auth_required: '需连接账号', backoff: '稍后重试', user_action_required: '待你处理', awaiting_confirmation: '等待餐厅确认', confirmed: '已确认', expired: '已结束' };
+const modes = { notify: '空位提醒', assist: '辅助预订', auto: '免费自动预订' };
+export type TaskAction = 'start' | 'pause' | 'check' | 'handoff' | 'reconcile' | 'continue_auto' | 'abandon' | 'delete';
+export type TaskFilter = 'all' | 'active' | 'available' | 'pending';
+export function isPending(task: Task) { return task.status === 'auth_required' || task.status === 'user_action_required' || task.status === 'awaiting_confirmation'; }
+
+function TaskCard({ task, busy, pendingBooking, accountConnected, onAction, onDetails, onLogin }: { task: Task; busy: boolean; pendingBooking?: Booking; accountConnected: boolean; onAction: (task: Task, action: TaskAction) => void; onDetails: (task: Task) => void; onLogin: () => void }) {
+  const canPause = task.status === 'active' || task.status === 'backoff';
+  const live = task.source !== 'demo';
+  const terminal = task.status === 'confirmed' || task.status === 'expired';
+  const waitingRestaurant = task.status === 'awaiting_confirmation' || pendingBooking?.status === 'pending_restaurant';
+  const hasPendingBooking = !!pendingBooking || waitingRestaurant;
+  const nextVerificationAt = pendingBooking?.nextVerificationAt ?? task.nextVerificationAt;
+  const verificationCount = pendingBooking?.verificationCount ?? task.verificationCount;
+  const verificationMessage = pendingBooking?.lastVerificationMessage ?? task.lastVerificationMessage;
+  return <article className="task-card">
+    <div className="task-top"><div className="restaurant-initial" aria-hidden="true">{task.restaurantName.slice(0, 1)}</div><div className="task-title"><div className="task-name-line"><h3><button type="button" className="task-name-button" onClick={() => onDetails(task)} aria-label={`查看任务详情 ${task.restaurantName}`}>{task.restaurantName}</button></h3>{task.source === 'demo' ? <span className="badge demo">演练</span> : null}</div><span className="task-mode">{modes[task.mode]}{task.groupId ? ` · ${task.groupId}` : ''}</span></div><span className={`status status-${task.status}`}><span />{task.status === 'auth_required' && accountConnected ? '登录已核验，待启用' : statusLabels[task.status] ?? task.status}</span></div>
+    <div className="task-details"><span><Icon name="calendar" size={16} />{task.dates.length > 1 ? `${task.dates[0]} 至 ${task.dates[task.dates.length - 1]}` : task.dates[0]}{task.dates.length > 1 ? ` · ${task.dates.length} 天` : ''}</span><span><Icon name="clock" size={16} />{task.timeStart}–{task.timeEnd} · {task.partySize} 人</span></div>
+    <p className="task-timing">目标间隔 {Number.isFinite(task.pollIntervalMs) ? `${task.pollIntervalMs}ms` : '待更新'}{typeof task.lastCheckDurationMs === 'number' && Number.isFinite(task.lastCheckDurationMs) ? ` · 最近检查耗时 ${task.lastCheckDurationMs}ms` : ''}{typeof task.effectiveIntervalMs === 'number' && Number.isFinite(task.effectiveIntervalMs) ? ` · 实际间隔 ${task.effectiveIntervalMs}ms` : ''}</p>
+    {task.slots?.length ? <div className="slot-list"><span className="slot-heading">发现符合条件的空位</span>{task.slots.slice(0, 4).map((slot, index) => <span className="slot-chip" key={`${slot.date}-${slot.time}-${index}`}>{slot.date} {slot.time} · {slot.partySize} 人{slot.seatType ? ` · ${slot.seatType}` : ''}</span>)}</div> : null}
+    {task.lastMessage ? <p className="task-message">{task.status === 'auth_required' && accountConnected ? '登录已核验。可以启用此任务，并恢复全部监控。' : task.lastMessage}</p> : null}
+    {task.lastError && task.lastError !== task.lastMessage ? <p className="task-message has-error">{task.lastError}</p> : null}
+    {hasPendingBooking || waitingRestaurant ? <div className="verification-box"><div className="verification-heading"><Icon name={busy ? 'refresh' : 'clock'} className={busy ? 'spin' : ''} size={15} /><strong>{task.status === 'user_action_required' && pendingBooking?.status === 'user_action_required' ? '需要你处理，系统会继续核验结果' : '系统自动核验结果'}</strong></div><p>{waitingRestaurant ? '请求已发送，等待餐厅确认。取得匹配的官方确认后，任务会完成并保留在预约记录。' : '系统会继续核对官方预约记录。结果明确前，不会再次提交同条件预约。'}</p>{verificationMessage && verificationMessage !== task.lastMessage && verificationMessage !== task.lastError ? <p className="verification-message">{verificationMessage}</p> : null}<div className="verification-meta">{typeof verificationCount === 'number' ? <span>已核验 {verificationCount} 次</span> : null}{nextVerificationAt ? <span>下次核验 {formatTime(nextVerificationAt)} 北京时间</span> : null}</div></div> : busy ? <p className="task-progress" role="status"><Icon name="refresh" size={14} className="spin" />当前任务正在处理，其他页面仍可查看。</p> : null}
+    {task.source === 'demo' ? <p className="demo-explanation">本地模拟流程 · 未查询或预订真实餐厅</p> : null}
+    <div className="task-footer"><span className="last-check">检查 {task.checkCount ?? 0} 次 · {task.lastCheckedAt ? formatTime(task.lastCheckedAt) : '尚未检查'}</span><div className="task-actions">
+      {live && task.status === 'user_action_required' && !hasPendingBooking && !!task.slots?.length ? <button className="button small primary-outline" type="button" disabled={busy} onClick={() => onAction(task, 'handoff')}>继续预订</button> : null}
+      {live && task.mode === 'auto' && !waitingRestaurant && (task.status === 'user_action_required' || pendingBooking?.status === 'outcome_unknown') ? <button className="button small primary-outline" type="button" disabled={busy || !accountConnected} title={accountConnected ? '先核对官方订单与当前页面，再继续已识别的免费确认流程' : '请先连接并核验已登录账号；系统会自动继续原预约'} onClick={() => onAction(task, 'continue_auto')}>继续自动处理</button> : null}
+      {live && hasPendingBooking ? <><button className="button small" type="button" disabled={busy} onClick={() => onAction(task, 'reconcile')}><Icon name="check" size={15} />立即核验</button>{!waitingRestaurant ? <button className="button small" type="button" disabled={busy} onClick={() => onAction(task, 'abandon')}>人工确认未预约</button> : null}</> : null}
+      {live && task.status === 'auth_required' ? <button className="button small primary-outline" type="button" disabled={accountConnected && (busy || hasPendingBooking)} onClick={() => accountConnected ? onAction(task, 'start') : onLogin()}><Icon name={accountConnected ? 'play' : 'link'} size={14} />{accountConnected ? '启用任务' : '连接账号'}</button> : live && !terminal && !hasPendingBooking ? <button className="button small" type="button" disabled={busy && !canPause} onClick={() => onAction(task, canPause ? 'pause' : 'start')}><Icon name={canPause ? 'pause' : 'play'} size={14} />{canPause ? '暂停' : '启动'}</button> : null}
+      {live && !terminal && !hasPendingBooking ? <button className="button small" type="button" disabled={busy} onClick={() => onAction(task, 'check')}><Icon name="refresh" size={14} />{busy ? '处理中…' : '检查'}</button> : null}
+      <button className="button small" type="button" onClick={() => onDetails(task)}>详情</button>
+      {live ? <a className="button small" href={task.restaurantUrl} target="_blank" rel="noreferrer"><Icon name="external" size={14} />官方页</a> : null}
+      <button className="icon-button delete-button" type="button" disabled={busy || hasPendingBooking} aria-label={`删除任务 ${task.restaurantName}`} title={hasPendingBooking ? '先核验已有预订后再删除任务' : '删除任务'} onClick={() => onAction(task, 'delete')}><Icon name="trash" size={17} /></button>
+    </div></div>
+  </article>;
+}
+
+export function Tasks({ state, loading, pending, filter, onFilter, onNew, onDemo, onEngine, onAction, onDetails, onLogin }: { state: AppState | null; loading: boolean; pending: ReadonlySet<string>; filter: TaskFilter; onFilter: (filter: TaskFilter) => void; onNew: () => void; onDemo: () => void; onEngine: () => void; onAction: (task: Task, action: TaskAction) => void; onDetails: (task: Task) => void; onLogin: () => void }) {
+  const [search, setSearch] = useState('');
+  const tasks = state?.tasks ?? [];
+  const pendingBookings = new Map<string, Booking>();
+  for (const booking of state?.bookings ?? []) if (['submitting', 'pending_restaurant', 'outcome_unknown', 'user_action_required'].includes(booking.status) && !pendingBookings.has(booking.taskId)) pendingBookings.set(booking.taskId, booking);
+  const pendingBookingTaskIds = new Set(pendingBookings.keys());
+  const submittingTaskIds = new Set(state?.bookings.filter(booking => booking.status === 'submitting').map(booking => booking.taskId) ?? []);
+  const visible = tasks.filter(task => (filter === 'all' || (filter === 'active' ? task.status === 'active' || task.status === 'backoff' : filter === 'available' ? !!task.slots?.length : isPending(task) || pendingBookingTaskIds.has(task.id))) && `${task.restaurantName} ${task.groupId ?? ''} ${task.restaurantUrl}`.toLocaleLowerCase().includes(search.toLocaleLowerCase()));
+  return <section className="tasks-section" aria-labelledby="tasks-heading">
+    <h2 id="tasks-heading">我的订座任务</h2>
+    {state?.engine.paused ? <div className="monitor-pause-notice"><Icon name="pause" size={16} /><span>全部自动监控已暂停。手动检查仍可使用。</span><button type="button" className="text-button" disabled={pending.has('engine')} onClick={onEngine}>恢复监控</button></div> : null}
+    <div className="task-toolbar"><div className="filter-tabs" role="group" aria-label="任务筛选">{([{ id: 'all', label: '全部' }, { id: 'active', label: '监控中' }, { id: 'available', label: '有空位' }, { id: 'pending', label: '待处理' }] as const).map(item => <button key={item.id} type="button" className={filter === item.id ? 'selected' : ''} aria-pressed={filter === item.id} onClick={() => onFilter(item.id)}>{item.label}</button>)}</div><div className="toolbar-controls"><label className="search-field"><Icon name="search" size={19} /><input aria-label="搜索订座任务" placeholder="搜索餐厅名称、链接或备注…" value={search} onInput={event => setSearch(event.currentTarget.value)} onChange={event => setSearch(event.target.value)} /></label><button type="button" className="text-button pause-all" disabled={!state || pending.has('engine')} onClick={onEngine}><Icon name={state?.engine.paused ? 'play' : 'pause'} size={16} />{state?.engine.paused ? '全部恢复' : '全部暂停'}</button></div></div>
+    {loading && !state ? <div className="empty-state loading-state"><Icon name="refresh" size={25} className="spin" /><p>正在连接本地服务…</p></div> : tasks.length === 0 ? <div className="empty-state"><EmptyTable /><h3>下一顿值得期待</h3><p>粘贴餐厅链接，核验信息后创建你的第一条任务。</p><div className="empty-actions"><button type="button" className="button primary" disabled={pending.has('new-task') || !state} onClick={onNew}><span>创建第一条任务</span></button><button type="button" className="button" disabled={pending.has('demo') || !state} onClick={onDemo}>{pending.has('demo') ? '演练准备中…' : '体验订座演练'}</button></div></div> : visible.length === 0 ? <div className="empty-state compact"><Icon name="search" size={30} /><h3>没有符合条件的任务</h3><p>试试其他关键词，或切换到全部任务。</p><button type="button" className="button" onClick={() => { setSearch(''); onFilter('all'); }}>查看全部任务</button></div> : <div className="task-list">{visible.map(task => <TaskCard key={task.id} task={task} busy={pending.has(task.id) || pending.has(`${task.id}:pause`) || state?.engine.currentTaskId === task.id || submittingTaskIds.has(task.id)} pendingBooking={pendingBookings.get(task.id)} accountConnected={state?.session.connected === true} onAction={onAction} onDetails={onDetails} onLogin={onLogin} />)}</div>}
+  </section>;
+}

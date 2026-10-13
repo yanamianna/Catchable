@@ -1,0 +1,12 @@
+.status-awaiting_confirmation { color: #6387ae; }
+.verification-box { padding: 12px 13px; margin-top: 13px; border-radius: 6px; border: 1px solid #e5ebf1; background: #f9fbfd; }
+.verification-heading { display: flex; align-items: center; gap: 7px; color: #708ba7; }
+.verification-heading strong { font-size: 11px; font-weight: 580; }
+.verification-box p { font-size: 11px; line-height: 1.8; color: #909bab; margin-top: 7px; }
+.verification-box .verification-message { color: #8492a3; }
+.verification-meta { display: flex; flex-wrap: wrap; gap: 7px 14px; font-size: 10px; color: #a1abba; margin-top: 7px; line-height: 1.7; }
+.booking-progress { display: flex; flex-wrap: wrap; gap: 8px 17px; padding: 12px 0 0; margin-top: 13px; border-top: 1px solid #f0f2f5; }
+.booking-progress span { display: inline-flex; gap: 6px; align-items: center; color: #a0a8b4; font-size: 10px; }
+.booking-progress span.current { color: #6485aa; }.booking-progress span.done { color: #819b70; }
+.booking-progress i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+@media (max-width: 767px) { .verification-box { padding: 11px; }.verification-heading strong, .verification-box p { font-size: 10px; }.verification-meta, .booking-progress span { font-size: 9px; } }
