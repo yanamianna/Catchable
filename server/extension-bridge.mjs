@@ -308,6 +308,12 @@ export class ExtensionBridge {
   async requestCDP(method, params = {}, sessionId) {
     if (!this.state().connected) throw bridgeError('Chrome 扩展尚未连接。', 'EXTENSION_NOT_CONNECTED');
     this.#validateCommand(method, params, sessionId);
+    // noDefaults preserves the personal browser's settings, but also skips
+    // Playwright's focus emulation. Restore it only for an owned page being
+    // activated, so animation-frame action checks work in an occluded window.
+    if (method === 'Page.bringToFront' && this.#sessions.get(sessionId)?.type === 'page') {
+      await this.requestCDP('Emulation.setFocusEmulationEnabled', { enabled: true }, sessionId);
+    }
     if (method === 'Browser.getVersion') {
       const version = this.#hello.userAgent.match(/(?:Chrome|Chromium)\/([\d.]+)/)?.[1] || '1.0.0.0';
       return { protocolVersion: '1.3', product: `Chrome/${version}`, revision: 'catchable-extension', userAgent: this.#hello.userAgent, jsVersion: '0' };

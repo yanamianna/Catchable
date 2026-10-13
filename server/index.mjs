@@ -58,8 +58,13 @@ export function createHttpServer({ store, engine, extensionBridge, frontendDir =
         }
         if (method === 'GET' && url.pathname === '/api/health') return sendJson(response, 200, { ok: true, service: 'catchtable-local', timestamp: engine.timestamp() });
         if (method === 'GET' && url.pathname === '/api/state') {
-          const bookings = store.listAttempts().map(({ taskSnapshot, ...booking }) => booking);
+          const bookings = store.listVisibleAttempts().map(({ taskSnapshot, ...booking }) => booking);
           return sendJson(response, 200, { tasks: store.listTasks(), events: store.listEvents(), bookings, notifications: store.listNotifications(), settings: store.settings(), session: engine.session, engine: engine.state(), stats: store.stats(), ...(extensionBridge ? { extension: extensionBridge.state() } : {}) });
+        }
+        if (method === 'POST' && url.pathname === '/api/records/clear') {
+          if (!['events', 'notifications', 'bookings', 'all'].includes(body.kind)) throw new HttpError(400, '记录类型须为 events、notifications、bookings 或 all。');
+          const cleared = await engine.enqueue(() => store.clearRecords(body.kind));
+          return sendJson(response, 200, { ok: true, cleared });
         }
         if (method === 'POST' && url.pathname === '/api/tasks') {
           if (store.listTasks().filter((task) => task.source === 'live').length >= TASK_LIMIT) throw new HttpError(409, `第一版最多保存 ${TASK_LIMIT} 条真实餐厅任务，请删除旧任务后再添加。`);

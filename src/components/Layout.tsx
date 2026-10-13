@@ -17,13 +17,12 @@ export function Sidebar({ page, onNavigate }: { page: Page; onNavigate: (page: P
   </aside>;
 }
 
-export function Activity({ state }: { state: AppState | null }) {
+export function Activity({ state, clearing = false, onClear }: { state: AppState | null; clearing?: boolean; onClear?: () => void }) {
   const events = state?.events.slice(0, 5) ?? [];
   return <aside className="activity" aria-label="运行动态">
-    <h2>运行动态</h2>
-    {events.length ? <div className="activity-events">{events.map(event => <div className="activity-event" key={event.id}><span className={`activity-dot ${event.level === 'error' ? 'danger' : ['warn', 'warning'].includes(event.level) ? 'warning' : 'green'}`} /><div><p>{event.source === 'demo' ? <span className="badge demo">演练</span> : null}{event.message}</p><time dateTime={event.createdAt}>{formatTime(event.createdAt)}</time></div></div>)}</div> : <div className="ready-event"><span className="activity-dot green" /><div><strong>{state ? '系统已就绪' : '连接本地服务中'}</strong><p>{state?.session.connected ? '添加任务，开始期待下一顿' : '连接账号后即可开始'}</p></div><span className="time-now">现在</span></div>}
-    <div className="workflow"><h3>订座流程</h3><div className="workflow-step current"><span className="step-dot" /><div><strong>发现空位</strong><p>持续监控餐厅，发现符合条件的空位</p></div><Icon name="arrow" size={17} className="flow-arrow" /></div><div className="workflow-step"><span className="step-dot" /><div><strong>核对条件</strong><p>自动核对日期、时间、人数等条件</p></div><Icon name="arrow" size={17} className="flow-arrow" /></div><div className="workflow-step"><span className="step-dot" /><div><strong>预订并确认</strong><p>按任务方式处理并核验预订结果</p></div></div></div>
-    <div className="activity-help"><Icon name="info" size={20} /><p>需要支付或人工确认时，会在这里提醒你。</p></div>
-    {state?.engine.accountWriteBlocked ? <div className="lock-notice">有一笔预订结果待核验。账号的自动预订已暂停，请在任务中核验结果。</div> : null}
+    <div className="activity-heading"><h2>运行动态</h2>{onClear ? <button type="button" className="text-button clear-records" disabled={clearing || !events.length} onClick={onClear}>{clearing ? '清除中…' : '清除动态'}</button> : null}</div>
+    {events.length ? <div className="activity-events">{events.map(event => <div className="activity-event" key={event.id}><span className={`activity-dot ${event.level === 'error' ? 'danger' : ['warn', 'warning'].includes(event.level) ? 'warning' : 'green'}`} /><div><p>{event.source === 'demo' ? <span className="badge demo">演练</span> : null}{event.message}</p><time dateTime={event.createdAt}>{formatTime(event.createdAt)}</time></div></div>)}</div> : <p className="activity-empty">{state ? '暂无运行动态' : '连接本地服务中…'}</p>}
+    <div className="activity-help"><Icon name="info" size={20} /><p>支付或验证码需要你处理。</p></div>
+    {state?.engine.accountWriteBlocked ? <div className="lock-notice">预订结果待核验，自动提交已暂停。</div> : null}
   </aside>;
 }

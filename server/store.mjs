@@ -20,6 +20,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, event_id TEXT NOT NULL, channel TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL, next_attempt_at TEXT, created_at TEXT NOT NULL, UNIQUE(event_id, channel));
       CREATE TABLE IF NOT EXISTS slots (task_id TEXT NOT NULL, slot_key TEXT NOT NULL, present INTEGER NOT NULL DEFAULT 0, generation INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(task_id, slot_key));
       CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id = 1), payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS record_clear_watermarks (kind TEXT PRIMARY KEY, cutoff_rowid INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS hidden_bookings (attempt_id TEXT PRIMARY KEY);
     `);
     this.db.prepare('INSERT OR IGNORE INTO settings (id, payload) VALUES (1, ?)').run(JSON.stringify({ pollIntervalMs: 1000, webhookUrl: '', enginePaused: false }));
     this.migrateIntervals(now());
@@ -92,8 +94,30 @@ export class Store {
     this.db.prepare('INSERT INTO events (id,payload,created_at) VALUES (?,?,?)').run(event.id, JSON.stringify(event), event.createdAt);
     return event;
   }
-  listEvents(limit = 120) { return this.db.prepare('SELECT payload FROM events ORDER BY created_at DESC, rowid DESC LIMIT ?').all(limit).map(read); }
+  listEvents(limit = 120) { return this.db.prepare("SELECT payload FROM events WHERE rowid > COALESCE((SELECT cutoff_rowid FROM record_clear_watermarks WHERE kind='events'),0) ORDER BY created_at DESC, rowid DESC LIMIT ?").all(limit).map(read); }
   eventsForBooking(bookingId) { return this.db.prepare("SELECT payload FROM events WHERE json_extract(payload,'$.bookingId')=? ORDER BY created_at,rowid").all(bookingId).map(read); }
+
+  clearRecords(kind) {
+    if (!['events', 'notifications', 'bookings', 'all'].includes(kind)) throw new TypeError('无效的记录类型。');
+    return this.transaction(() => {
+      const cleared = { events: 0, notifications: 0, bookings: 0 };
+      // Keep events and notifications for submission evidence, delivery and
+      // deduplication; clearing only moves their persisted display boundary.
+      for (const table of ['events', 'notifications']) {
+        if (kind !== 'all' && kind !== table) continue;
+        const previous = this.db.prepare('SELECT cutoff_rowid FROM record_clear_watermarks WHERE kind=?').get(table)?.cutoff_rowid || 0;
+        cleared[table] = this.db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE rowid > ?`).get(previous).count;
+        const cutoff = this.db.prepare(`SELECT COALESCE(MAX(rowid),0) AS cutoff FROM ${table}`).get().cutoff;
+        this.db.prepare('INSERT INTO record_clear_watermarks(kind,cutoff_rowid) VALUES (?,?) ON CONFLICT(kind) DO UPDATE SET cutoff_rowid=excluded.cutoff_rowid').run(table, cutoff);
+      }
+      if (kind === 'all' || kind === 'bookings') {
+        // Unresolved attempts must stay visible. Never remove their identity,
+        // snapshots, order references or the engine's account write guards.
+        cleared.bookings = this.db.prepare("INSERT OR IGNORE INTO hidden_bookings(attempt_id) SELECT id FROM attempts WHERE status IN ('confirmed','rejected')").run().changes;
+      }
+      return cleared;
+    });
+  }
 
   recordSlots(taskId, slots, { observedDates = null } = {}) {
     const old = this.db.prepare('SELECT slot_key,present,generation FROM slots WHERE task_id = ?').all(taskId);
@@ -132,7 +156,7 @@ export class Store {
       .run(JSON.stringify(notification), notification.status, notification.nextAttemptAt, notification.id);
     return notification;
   }
-  listNotifications(limit = 120) { return this.db.prepare('SELECT payload FROM notifications ORDER BY created_at DESC,rowid DESC LIMIT ?').all(limit).map(read); }
+  listNotifications(limit = 120) { return this.db.prepare("SELECT payload FROM notifications WHERE rowid > COALESCE((SELECT cutoff_rowid FROM record_clear_watermarks WHERE kind='notifications'),0) ORDER BY created_at DESC,rowid DESC LIMIT ?").all(limit).map(read); }
   nextNotification(now = isoNow()) {
     return read(this.db.prepare("SELECT payload FROM notifications WHERE status = 'queued' AND next_attempt_at <= ? ORDER BY next_attempt_at LIMIT 1").get(now));
   }
@@ -150,6 +174,7 @@ export class Store {
     return attempt;
   }
   listAttempts(limit = 120) { return this.db.prepare('SELECT payload FROM attempts ORDER BY created_at DESC,rowid DESC LIMIT ?').all(limit).map(read); }
+  listVisibleAttempts(limit = 120) { return this.db.prepare("SELECT payload FROM attempts WHERE status NOT IN ('confirmed','rejected') OR id NOT IN (SELECT attempt_id FROM hidden_bookings) ORDER BY created_at DESC,rowid DESC LIMIT ?").all(limit).map(read); }
   listPendingAttempts() { return this.db.prepare("SELECT payload FROM attempts WHERE status IN ('submitting','outcome_unknown','user_action_required','pending_restaurant') ORDER BY created_at,rowid").all().map(read); }
   attemptsForTask(taskId) { return this.db.prepare('SELECT payload FROM attempts WHERE task_id = ? ORDER BY created_at DESC,rowid DESC').all(taskId).map(read); }
   hasUncertainLiveAttempt() {
@@ -175,7 +200,7 @@ export class Store {
     return {
       totalTasks: tasks.filter((task) => task.source === 'live').length,
       activeTasks: tasks.filter((task) => task.source === 'live' && ['active', 'backoff'].includes(task.status)).length,
-      availableEvents: this.db.prepare("SELECT COUNT(*) AS count FROM events WHERE json_extract(payload,'$.source')='live' AND json_extract(payload,'$.type')='slot_available'").get().count,
+      availableEvents: this.db.prepare("SELECT COUNT(*) AS count FROM notifications WHERE rowid > COALESCE((SELECT cutoff_rowid FROM record_clear_watermarks WHERE kind='notifications'),0) AND channel='in_app' AND json_extract(payload,'$.source')='live' AND json_extract(payload,'$.eventType')='slot_available'").get().count,
       confirmedBookings: bookings.filter((booking) => booking.source === 'live' && booking.status === 'confirmed').length,
       pendingRestaurantBookings: bookings.filter((booking) => booking.source === 'live' && booking.status === 'pending_restaurant').length,
       demoBookings: bookings.filter((booking) => booking.source === 'demo' && booking.status === 'confirmed').length,

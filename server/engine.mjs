@@ -198,7 +198,7 @@ export class Engine {
     const metrics = { lastCheckStartedAt: new Date(startedAtMs).toISOString(),
       effectiveIntervalMs: original.lastCheckStartedAt ? Math.max(0, startedAtMs - Date.parse(original.lastCheckStartedAt)) : null };
     let observation;
-    try { observation = await adapter.inspect(original); }
+    try { observation = await adapter.inspect(original,{firstMatch:original.source==='live' && original.mode==='auto' && original.autoConsent===true}); }
     catch (error) { observation = { status: 'unknown', slots: [], message: safeMessage(error, '页面检查失败。') }; }
     finally { this.currentTaskId = null; }
     metrics.lastCheckDurationMs = Math.max(0, this.now() - startedAtMs);
@@ -227,7 +227,7 @@ export class Engine {
       const message = observation?.message || '目前无法判断空位，保留上次有效结果并延后重试。';
       this.store.patchTask(id, { ...metrics, status: preservePaused ? 'paused' : 'backoff', lastCheckedAt: timestamp, lastObservationStatus: 'unknown',
         nextCheckAt: preservePaused ? null : new Date(this.now() + delay).toISOString(), failureCount: failures, lastMessage: message, checkCount: count }, timestamp);
-      this.event(task, 'observation_unknown', message, 'warning');
+      this.event(task, 'observation_unknown', message, 'warning', { diagnostics: observation?.diagnostics ?? null });
       if (failures === 3) this.notify(task, 'attention_required', '连续三次未能读取有效空位，请检查浏览器或登录状态。');
       return;
     }
@@ -255,11 +255,11 @@ export class Engine {
         this.store.patchTask(id, { lastMessage: '发现匹配空位，但同组另有预约等待核验；监控继续，暂不创建第二桌。' }, timestamp);
         return;
       }
-      await this.prepareTask(this.task(id), slots[0], { adapter });
+      await this.prepareTask(this.task(id), slots[0], { adapter, inspectionId:observation.inspectionId });
     }
   }
 
-  async prepareTask(task, slot, { adapter = this.adapter, handoff = false } = {}) {
+  async prepareTask(task, slot, { adapter = this.adapter, handoff = false, inspectionId } = {}) {
     if (Date.parse(task.deadline) <= this.now() || slot.date < localDate(this.now())) throw new HttpError(409, '任务已过期或空位日期已过去，不能继续预约。');
     if (task.source === 'live' && this.store.hasUncertainLiveAttempt()) throw new HttpError(409, '账户有结果不明的提交，新预订已阻止。请先核验已有预约。');
     const pending = this.store.attemptsForTask(task.id).find((attempt) => PENDING_ATTEMPT_STATUSES.has(attempt.status));
@@ -273,7 +273,7 @@ export class Engine {
     this.event(task, 'booking_started', '已记录本次预约尝试，结果确认前不会重复提交。', 'info', { bookingId: attempt.id, slot });
     let result;
     this.currentTaskId=task.id;
-    try { result = await adapter.prepare(task, slot, {onBeforeSubmit:this.beforeSubmit(attempt),...this.bookingContactOptions(task)}); }
+    try { result = await adapter.prepare(task, slot, {onBeforeSubmit:this.beforeSubmit(attempt),...this.bookingContactOptions(task),...(typeof inspectionId==='string'?{inspectionId}:{})}); }
     catch (error) { result = { status: 'outcome_unknown', message: safeMessage(error, '提交结果不明，请核验已有预约。') }; }
     finally {this.currentTaskId=null;}
     if(result?.phase==='authentication' && this.adapter.lastSession)this.applySession(this.adapter.lastSession);

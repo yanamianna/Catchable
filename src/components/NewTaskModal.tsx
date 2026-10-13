@@ -29,8 +29,10 @@ function nextWeek(date: string) { return new Date(new Date(`${date}T00:00:00Z`).
 function validateRestaurantUrl(value: string) {
   let parsed: URL;
   try { parsed = new URL(value.trim()); } catch { throw new Error('请粘贴 Catchtable 国际站的具体餐厅链接。'); }
-  if (parsed.protocol !== 'https:' || !['www.catchtable.net', 'catchtable.net'].includes(parsed.hostname) || parsed.username || parsed.password || parsed.port || parsed.search || parsed.hash || !/^\/(?:[a-z]{2}(?:-[A-Za-z]{2})?\/)?shop\/[A-Za-z0-9_-]+\/?$/.test(parsed.pathname)) throw new Error('请使用 https://www.catchtable.net/shop/餐厅标识，可带语言路径，不带查询参数。');
-  return parsed.toString();
+  const shopPath = parsed.pathname.match(/^(\/(?:[a-z]{2}(?:-[A-Za-z]{2})?\/)?)(?:explore\/)?shop\/([A-Za-z0-9_-]+)\/?$/);
+  if (parsed.protocol !== 'https:' || !['www.catchtable.net', 'catchtable.net'].includes(parsed.hostname) || parsed.username || parsed.password || parsed.port || parsed.search || parsed.hash || !shopPath) throw new Error('请使用 Catchtable 官方餐厅链接，可带语言路径，不带查询参数。');
+  parsed.pathname = `${shopPath[1]}shop/${shopPath[2]}`;
+  return parsed.href.replace(/\/$/, '');
 }
 
 export function NewTaskModal({ onClose, onCreate, interval, currentDate }: { onClose: () => void; onCreate: (task: NewTask) => Promise<void>; interval: number; currentDate: string }) {

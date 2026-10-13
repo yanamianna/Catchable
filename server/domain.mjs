@@ -31,11 +31,13 @@ export function validateBookingContactSettings(input,current={}) {
 export function restaurantUrl(value) {
   let url;
   try { url = new URL(value); } catch { throw new HttpError(400, '请输入有效的 Catchtable 餐厅网址。'); }
+  const shopPath = url.pathname.match(/^(\/(?:[a-z]{2}(?:-[A-Za-z]{2})?\/)?)(?:explore\/)?shop\/([A-Za-z0-9_-]+)\/?$/);
   if (url.protocol !== 'https:' || !['catchtable.net', 'www.catchtable.net'].includes(url.hostname)
     || url.username || url.password || url.port || url.search || url.hash
-    || !/^\/(?:[a-z]{2}(?:-[A-Za-z]{2})?\/)?shop\/[A-Za-z0-9_-]+\/?$/.test(url.pathname)) {
-    throw new HttpError(400, '仅支持 https://www.catchtable.net/shop/餐厅标识（可带语言路径），不接受其他域名或查询参数。');
+    || !shopPath) {
+    throw new HttpError(400, '请输入 Catchtable 官方餐厅链接，不接受其他域名或查询参数。');
   }
+  url.pathname = `${shopPath[1]}shop/${shopPath[2]}`;
   return url.href.replace(/\/$/, '');
 }
 

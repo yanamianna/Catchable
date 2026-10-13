@@ -1,4 +1,5 @@
 import { mkdir } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { HttpError, restaurantUrl, safeMessage } from './domain.mjs';
 import { BrowserProfileInUseError, initializeSessionRestorePreferences, launchManualBrowser, probeProfileOccupancy } from './browser-launch.mjs';
@@ -11,7 +12,7 @@ import { connectExtensionContext } from './extension-context.mjs';
 const MONTHS = ['january','february','march','april','may','june','july','august','september','october','november','december'];
 const CHINESE_MONTHS = ['一','二','三','四','五','六','七','八','九','十','十一','十二'];
 const AUTH = /登录或注册|使用谷歌账号登录|Sign in with Google|Continue with Apple|log in|로그인/i;
-const SOLD_OUT = /已满员|已满|Sold out|No available times|Fully booked|예약 마감|예약 가능한 시간이 없습니다/i;
+const SOLD_OUT = /已满员|已满|此日期不提供在线预订|Sold out|No available times|Fully booked|예약 마감|예약 가능한 시간이 없습니다/i;
 const MANUAL_GUIDANCE = ['点击「打开普通登录窗口」，在普通专用浏览器中完成官方登录，可选择电子邮件或 Google。', '登录完成后关闭这个专用浏览器的所有窗口，再点击「连接并核验登录」。', '其他个人浏览器窗口可以保留；系统不会关闭或读取个人浏览器资料。'];
 const EXTENSION_GUIDANCE=['在平常使用的 Chrome 中加载本机扩展并配对，保持 Chrome 和扩展连接打开。','在同一个 Chrome 中完成 Catchtable 官网登录，再点击「核验扩展登录」。无需关闭浏览器。'];
 
@@ -138,7 +139,7 @@ function shopId(value) {
   try {
     const url = new URL(value);
     if (url.protocol !== 'https:' || !['catchtable.net','www.catchtable.net'].includes(url.hostname) || url.port || url.username || url.password) return null;
-    const match = url.pathname.match(/^\/(?:[a-z]{2}(?:-[A-Za-z]{2})?\/)?shop\/([^/]+)\/?$/);
+    const match = url.pathname.match(/^\/(?:[a-z]{2}(?:-[A-Za-z]{2})?\/)?(?:explore\/)?shop\/([^/]+)\/?$/);
     return match && !/%2f|%5c/i.test(match[1]) ? match[1] : null;
   } catch { return null; }
 }
@@ -256,6 +257,7 @@ export class CatchtableAdapter {
     this.lastSession = classifySessionSnapshots([], {browserOpen:false,browserMode:this.browserMode});
     this.context = null; this.sessionPage = null; this.watchPages = new Map(); this.bookingPages = new Map(); this.bookingFlows = new Map();
     this.authStates=new WeakMap();
+    this.inspections=new Map();
     this.newTabAuth=null;
   }
   get hasContext() { return Boolean(this.context); }
@@ -399,6 +401,7 @@ export class CatchtableAdapter {
     context.on?.('close',() => {
       if(this.context!==context)return;
       this.context=null;this.sessionPage=null;this.watchPages.clear();this.bookingPages.clear();this.bookingFlows.clear();
+      this.inspections.clear();
       this.newTabAuth=null;
       this.#cacheSession(classifySessionSnapshots([],{browserOpen:false,browserMode:this.browserMode}));
     });
@@ -613,6 +616,7 @@ export class CatchtableAdapter {
   }
   async #calendar(page, task) {
     const url = `https://www.catchtable.net/zh-CN/shop/${shopId(task.restaurantUrl)}`;
+    await page.bringToFront();
     const authReady=this.#expectPageAuth(page);
     await page.goto(url,{waitUntil:'domcontentloaded',timeout:30000});
     const auth=await authReady;
@@ -622,12 +626,17 @@ export class CatchtableAdapter {
       throw new Error('AUTH_REQUIRED');
     }
     const opener = page.getByRole('button',{name:/^日期.*时间.*人$|^Date.*Time.*(?:People|Guests|Party)/i});
-    try { await opener.waitFor({state:'visible',timeout:15000}); } catch {
+    const reserveEntry=page.getByRole('button',{name:/^(?:预订|Reserve|Book now|예약하기)$/i});
+    const entries=opener.or(reserveEntry).filter({visible:true});
+    try { await entries.first().waitFor({state:'visible',timeout:15000}); } catch {
       await this.#dismiss(page);
       if (AUTH.test(await page.locator('body').innerText())) throw new Error('AUTH_REQUIRED');
-      await opener.waitFor({state:'visible',timeout:5000});
+      await entries.first().waitFor({state:'visible',timeout:5000});
     }
-    await this.#settledAction(page,()=>opener.click());
+    const inline=opener.filter({visible:true});
+    const entry=await inline.count() ? inline : reserveEntry.filter({visible:true});
+    if(shopId(page.url())!==shopId(task.restaurantUrl) || await entry.count()!==1)throw new Error('无法唯一确认当前餐厅的选座入口。');
+    await this.#settledAction(page,()=>entry.click());
     const dialog = page.getByRole('dialog').last();
     await dialog.waitFor({state:'visible'});
     const partyButton = dialog.locator('button.rounded-full').filter({hasText:new RegExp(`^${task.partySize}$`)});
@@ -635,23 +644,38 @@ export class CatchtableAdapter {
     await this.#settledAction(page,()=>partyButton.click());
     return dialog;
   }
-  async #selectDate(page, dialog, date) {
+  async #readCalendarCells(dialog) {
+    return dialog.locator('[role="button"][aria-label], [role="checkbox"][aria-label]').evaluateAll(elements=>{
+        const visible=element=>{const rect=element.getBoundingClientRect(),style=getComputedStyle(element);return rect.width>0 && rect.height>0 && style.visibility!=='hidden' && style.visibility!=='collapse' && !element.closest('[aria-hidden="true"]');};
+        const root=elements[0]?.closest('[role="dialog"]');
+        const loading=Boolean(root && [...root.querySelectorAll('[aria-busy="true"],[role="progressbar"]')].some(visible));
+        const selectedParties=root ? [...root.querySelectorAll('button.rounded-full')].filter(button=>{
+          const css=getComputedStyle(button);
+          return visible(button) && (button.getAttribute('aria-pressed')==='true' || (css.color==='rgb(255, 255, 255)' && css.backgroundColor!=='rgba(0, 0, 0, 0)' && css.backgroundColor!=='rgb(255, 255, 255)'));
+        }) : [];
+        const selectedPartySize=selectedParties.length===1 ? Number(selectedParties[0].textContent.trim()) : null;
+        return {loading,selectedPartySize,cells:elements.map((element,index)=>{
+          const rect=element.getBoundingClientRect(),shown=visible(element);
+          const hit=shown?document.elementFromPoint(rect.left+rect.width/2,rect.top+rect.height/2):null;
+          return {index,label:element.getAttribute('aria-label') || '',visible:shown,exposed:Boolean(hit && (hit===element || element.contains(hit))),
+            disabled:Boolean(element.matches(':disabled') || element.disabled || element.closest('[aria-disabled="true"]'))};
+        })};
+    });
+  }
+  async #selectDate(page, dialog, date, initialCalendar=null, partySize=null) {
     for (let step=0;step<13;step++) {
-      const cells = await dialog.locator('[role="button"][aria-label], [role="checkbox"][aria-label]').all();
-      for (const cell of cells) {
-        if (!await cell.isVisible()) continue;
-        if (calendarLabelToDate(await cell.getAttribute('aria-label')) !== date) continue;
-        // Mobiscroll renders adjacent, clipped calendar slides with the same labels.
-        // Only the date cell actually exposed to pointer input is the current calendar.
-        const exposed = await cell.evaluate(el => {
-          const r=el.getBoundingClientRect();
-          if (el.closest('[aria-hidden="true"]') || r.width===0 || r.height===0) return false;
-          const hit=document.elementFromPoint(r.left+r.width/2,r.top+r.height/2);
-          return hit===el || (hit && el.contains(hit));
-        });
-        if (!exposed) continue;
-        if (!await cell.isEnabled()) return false;
-        await this.#settledAction(page,()=>cell.click());
+      const cells = dialog.locator('[role="button"][aria-label], [role="checkbox"][aria-label]');
+      const calendar=initialCalendar || await this.#readCalendarCells(dialog);
+      initialCalendar=null;
+      if(calendar.loading)throw new Error('日历筛选仍在加载，稍后重新检查。');
+      if(partySize!==null && calendar.selectedPartySize!==partySize)throw new Error('当前用餐人数尚未核验，稍后重新检查。');
+      // Mobiscroll also renders clipped adjacent slides. One batched DOM read
+      // identifies the unique date actually exposed to pointer input.
+      const matching=calendar.cells.filter(cell=>cell.visible && cell.exposed && calendarLabelToDate(cell.label)===date);
+      if(matching.length>1)throw new Error('目标日期出现多个可点击日历控件，尚未继续选择。');
+      if(matching.length===1) {
+        if(matching[0].disabled)return false;
+        await this.#settledAction(page,()=>cells.nth(matching[0].index).click());
         return true;
       }
       const header = await dialog.getByRole('button',{name:/^\d{4}年/}).innerText().catch(()=> '');
@@ -677,26 +701,72 @@ export class CatchtableAdapter {
         buttons:[...el.querySelectorAll('button')].filter(b=>b.getBoundingClientRect().width>0).map(b=>({text:b.innerText.trim(),disabled:b.disabled || b.getAttribute('aria-disabled')==='true'}))};
     },page.url());
   }
-  async inspect(task) {
+  async inspect(task,{firstMatch=task.mode==='auto' && task.autoConsent===true}={}) {
+    this.inspections.delete(task.id);
     if (!shopId(task.restaurantUrl)) return {status:'unknown',slots:[],message:'餐厅地址无效。'};
     const page = await this.#page(task);
     if (!page) return {status:'auth_required',slots:[],message:'请先连接专用浏览器。'};
     try {
       const dialog = await this.#calendar(page,task);
-      const slots = []; const observedDates=[]; let unknownCount=0;
+      let initialCalendar=await this.#readCalendarCells(dialog);
+      if(initialCalendar.loading)throw new Error('日历筛选仍在加载，稍后重新检查。');
+      if(initialCalendar.selectedPartySize!==task.partySize)throw new Error('当前用餐人数尚未核验，稍后重新检查。');
+      const calendarDates=new Map();
+      for(const cell of initialCalendar.cells) {
+        if(!cell.visible || !cell.exposed)continue;
+        const date=calendarLabelToDate(cell.label);
+        if(date)calendarDates.set(date,[...(calendarDates.get(date) || []),cell]);
+      }
+      const disabledDates=new Set(task.dates.filter(date=>calendarDates.get(date)?.length===1 && calendarDates.get(date)[0].disabled));
+      const slots = []; const observedDates=task.dates.filter(date=>disabledDates.has(date)); let unknownCount=0;
       for (const date of task.dates) {
-        if (!await this.#selectDate(page,dialog,date)) { observedDates.push(date); continue; }
+        if(disabledDates.has(date))continue;
+        const calendar=initialCalendar;initialCalendar=null;
+        if (!await this.#selectDate(page,dialog,date,calendar,task.partySize)) { observedDates.push(date); continue; }
         const result = parseAvailability(await this.#snapshot(page,dialog),{...task,dates:[date]});
         if (result.status==='auth_required') return result;
         if (result.status==='unknown') unknownCount++; else observedDates.push(date);
         slots.push(...result.slots);
+        if(firstMatch===true && result.status==='available' && result.slots.length) {
+          const inspectionId=randomUUID();
+          this.inspections.set(task.id,{inspectionId,page,dialog,checkedAt:Date.now(),conditions:this.#inspectionConditions(task)});
+          return {status:'available',slots:result.slots,inspectionId,observedDates,complete:unknownCount===0 && observedDates.length===task.dates.length,
+            message:`已发现 ${date} 的 ${result.slots.length} 个匹配时间，立即进入预约；其余日期留待后续检查。`};
+        }
       }
       const restaurantName = await page.getByRole('heading',{level:2}).first().innerText().catch(()=>task.restaurantName);
       if (slots.length) return {status:'available',slots,observedDates,complete:unknownCount===0,restaurantName,message:`发现 ${slots.length} 个匹配时间。${unknownCount ? '部分日期暂未核验。' : ''}`};
       return {status:unknownCount ? 'unknown' : 'unavailable',slots:[],observedDates,complete:unknownCount===0,restaurantName,message:unknownCount?'部分日期无法判断，稍后检查。':'当前没有匹配空位。'};
     } catch(error) {
-      return {status:error.message==='AUTH_REQUIRED'?'auth_required':'unknown',slots:[],message:error.message==='AUTH_REQUIRED'?'登录已失效，请重新连接。':`检查未完成：${error.message.split('\n')[0]}`};
+      const diagnostics=await page.evaluate(()=>{
+        const visible=element=>{const rect=element.getBoundingClientRect();return rect.width>0 && rect.height>0 && getComputedStyle(element).visibility!=='hidden';};
+        return {route:location.pathname.slice(0,200),title:document.title.slice(0,160),readyState:document.readyState,
+          headings:[...document.querySelectorAll('h1,h2,h3')].filter(visible).slice(0,10).map(element=>element.innerText.trim().slice(0,160)),
+          buttons:[...document.querySelectorAll('button,a,[role="button"]')].filter(visible).slice(0,40).map(element=>({label:(element.innerText || element.getAttribute('aria-label') || '').trim().slice(0,120),disabled:Boolean(element.matches(':disabled') || element.closest('[aria-disabled="true"]'))}))};
+      }).catch(()=>null);
+      if(diagnostics)diagnostics.blockedBy=String(error.message || '').split('\n').filter(line=>/not enabled|intercepts pointer events|not stable|not visible/.test(line)).map(line=>line.replace(/\u001b\[[0-9;]*m/g,'').trim()).slice(0,3);
+      return {status:error.message==='AUTH_REQUIRED'?'auth_required':'unknown',slots:[],diagnostics,message:error.message==='AUTH_REQUIRED'?'登录已失效，请重新连接。':`检查未完成：${error.message.split('\n')[0]}`};
     }
+  }
+  #inspectionConditions(task) {
+    return JSON.stringify([shopId(task.restaurantUrl),task.restaurantName,task.dates,task.partySize,task.timeStart,task.timeEnd]);
+  }
+  async #reuseInspection(task,slot,inspectionId) {
+    const inspected=this.inspections.get(task.id);
+    this.inspections.delete(task.id);
+    if(!inspected || inspected.inspectionId!==inspectionId || Date.now()-inspected.checkedAt>5000 || inspected.conditions!==this.#inspectionConditions(task)
+      || inspected.page.isClosed() || this.watchPages.get(task.id)!==inspected.page || !this.context?.pages?.().includes(inspected.page))return null;
+    try {
+      const auth=this.#trackPageAuth(inspected.page);
+      if(auth && auth.status!=='authenticated')return null;
+      if(!await inspected.dialog.isVisible())return null;
+      const availability=parseAvailability(await this.#snapshot(inspected.page,inspected.dialog),{...task,dates:[slot.date]});
+      const current=availability.slots.find(value=>value.date===slot.date && value.time===slot.time && value.partySize===slot.partySize);
+      if(!current)return null;
+      this.watchPages.delete(task.id);
+      this.bookingPages.set(task.id,inspected.page);
+      return {page:inspected.page,dialog:inspected.dialog,current};
+    }catch {return null;}
   }
   async #receipt(page, task, slot) {
     if(typeof page.evaluate==='function') {
@@ -919,14 +989,15 @@ export class CatchtableAdapter {
     }
   }
   async prepare(task, slot, options={}) {
-    const page = await this.#page(task,true);
+    const inspected=typeof options.inspectionId==='string'?await this.#reuseInspection(task,slot,options.inspectionId):null;
+    const page = inspected?.page || await this.#page(task,true);
     if (!page) return {status:'user_action_required',phase:'authentication',submitted:false,message:'请先在专用浏览器登录。'};
     const observation=this.#observeOrders(page,task,slot);
     try {
-      const dialog = await this.#calendar(page,task);
-      if (!await this.#selectDate(page,dialog,slot.date)) return {status:'rejected',message:'日期已不可预约。'};
-      const availability = parseAvailability(await this.#snapshot(page,dialog),task);
-      const current = availability.slots.find(s=>s.date===slot.date && s.time===slot.time && s.partySize===slot.partySize);
+      const dialog = inspected?.dialog || await this.#calendar(page,task);
+      if (!inspected && !await this.#selectDate(page,dialog,slot.date,null,task.partySize)) return {status:'rejected',message:'日期已不可预约。'};
+      const availability = inspected?{status:'available',slots:[inspected.current]}:parseAvailability(await this.#snapshot(page,dialog),task);
+      const current = inspected?.current || availability.slots.find(s=>s.date===slot.date && s.time===slot.time && s.partySize===slot.partySize);
       if (!current) return {status:availability.status==='unknown'?'user_action_required':'rejected',phase:'before_submit',submitted:false,message:'重新核验时空位已变化，请检查。'};
       this.bookingFlows.set(task.id,{page,slot:{...slot},calendarVerified:true});
       await this.#settledAction(page,()=>dialog.getByRole('button',{name:current.label,exact:true}).click());

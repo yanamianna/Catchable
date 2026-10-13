@@ -26,6 +26,12 @@
 .login-help summary { cursor: pointer; width: fit-content; }
 .login-help ol, .login-help ul { padding-left: 23px; margin: 10px 0; }
 .login-help p { margin-bottom: 12px; }
+.login-help summary, .interval-help summary { cursor: pointer; min-height: 44px; display: list-item; padding-block: 8px; }
+.records-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 22px; }
+.records-heading .section-intro { margin-bottom: 0; }
+.activity-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.activity-empty { color: var(--muted); font-size: 12px; padding: 24px 0; }
+button.button.clear-records, button.text-button.clear-records { min-height: 44px; font-size: 12px; flex-shrink: 0; }
 button.metric { background: transparent; border: 0; border-radius: 5px; text-align: left; color: inherit; transition: background .15s; }
 button.metric:last-child { border-right: 0; }
 button.metric:hover { background: #fff7f2; }

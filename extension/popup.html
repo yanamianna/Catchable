@@ -8,11 +8,11 @@
     <form id="connect-form">
       <label for="pairing-code">本地配对码</label>
       <input id="pairing-code" type="password" autocomplete="off" spellcheck="false" placeholder="从本地控制台复制后粘贴" maxlength="128">
-      <p class="hint">仅连接本机 127.0.0.1:4174，配对码保存在本机扩展中。</p>
+      <p class="hint">从控制台的「登录设置」复制配对码。</p>
       <div class="actions"><button id="connect" type="submit">连接本地系统</button><button id="disconnect" type="button" class="secondary">断开</button></div>
     </form>
     <button id="open-console" class="console" type="button">打开本地控制台 <span aria-hidden="true">↗</span></button>
-    <p class="scope">助手会新建 Catchtable 标签页，使用当前 Chrome 的登录状态。不会关闭您的其他标签页。连接成功后，请在控制台核验登录再启动任务。</p>
+    <p class="scope">连接后在控制台核验登录，再启动任务。</p>
     <p id="error" class="error" role="alert" hidden></p>
   </main>
   <script src="popup.js"></script>

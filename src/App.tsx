@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, useAppState } from './api';
-import type { NewTask, Page, Task } from './types';
+import type { NewTask, Page, RecordKind, Task } from './types';
 import { Activity, Sidebar } from './components/Layout';
 import { Icon } from './components/Icon';
 import { NewTaskModal } from './components/NewTaskModal';
@@ -56,7 +56,7 @@ export default function App() {
       const result = await api<{ url?: string }>(`/api/tasks/${encodeURIComponent(task.id)}/action`, { action });
       if (action === 'handoff') {
         // 后台在专用浏览器中准备预订；普通新标签只作为官方入口。
-        if (result.url && task.source !== 'demo') setNotice({ message: '已在专用浏览器准备预订，请前往该浏览器完成确认。' });
+        if (result.url && task.source !== 'demo') setNotice({ message: '已准备预订，请在 Catchtable 页面完成确认。' });
       }
       return result;
     }, action === 'delete' ? '任务已删除。' : action === 'start' ? state?.engine.paused ? '任务已启用，但全部监控仍暂停。点击「恢复监控」后开始自动检查。' : '任务已启动，运行结果会显示在动态中。' : action === 'pause' ? '任务已暂停。' : action === 'check' ? '已完成本次检查，请查看任务状态。' : action === 'reconcile' ? '核验已完成，请查看预约记录。' : action === 'continue_auto' ? '已继续处理原预约，后续结果会自动同步到预约记录。' : undefined).catch(() => {});
@@ -66,6 +66,10 @@ export default function App() {
     setNotice({ message: result.session.message ?? '登录状态已更新，请查看账号面板。' });
   }
   function engineAction() { void perform('engine', () => api('/api/engine/action', { action: state?.engine.paused ? 'resume_all' : 'pause_all' }), state?.engine.paused ? '已恢复监控。' : '已暂停全部监控。').catch(() => {}); }
+  function clearRecords(kind: RecordKind) {
+    const labels = { events: '运行动态', notifications: '全部通知', bookings: '已结束预约记录', all: '历史消息记录' };
+    void perform('clear-records', () => api('/api/records/clear', { kind }), `${labels[kind]}已清除。`).catch(() => {});
+  }
   const availableEvents = state?.stats.availableEvents ?? 0;
   const pendingTasks = new Set(state?.tasks.filter(isPending).map(task => task.id) ?? []);
   state?.bookings.filter(booking => booking.source === 'live' && ['outcome_unknown','user_action_required','pending_restaurant','submitting'].includes(booking.status)).forEach(booking => pendingTasks.add(booking.taskId));
@@ -86,9 +90,9 @@ export default function App() {
       <div className="metrics" aria-label="订座统计">{metrics.map(metric => <button type="button" className="metric" key={metric.label} aria-label={`${metric.label} ${state ? metric.value : '—'}，${metric.detail}`} title={metric.detail} disabled={!state} onClick={metric.action}><span className={`metric-dot ${metric.color}`} /><div><span className="metric-label">{metric.label}</span><strong>{state ? metric.value : '—'}</strong><span className="metric-action">{metric.actionLabel}<Icon name="arrow" size={12} /></span></div></button>)}</div>
       <Tasks state={state} loading={loading} pending={pending} filter={taskFilter} onFilter={setTaskFilter} onNew={() => setModal(true)} onDemo={() => void perform('demo', () => api('/api/demo/run', {}), '演练已运行，所有模拟数据已标记。未查询或预订真实餐厅。').catch(() => {})} onEngine={engineAction} onAction={onTaskAction} onDetails={task => setDetailTaskId(task.id)} onLogin={() => navigate('settings')} />
       {state?.tasks.some(task => task.source === 'demo') ? <p className="demo-footnote"><span className="badge demo">演练</span>模拟结果单独标记，不计入真实预约成功。可删除演练任务，历史模拟记录仍会保留。</p> : null}
-    </> : page === 'bookings' ? <Bookings state={state} filter={bookingFilter} onFilter={setBookingFilter} onTask={showTask} /> : page === 'notifications' ? <Notifications state={state} filter={notificationFilter} onFilter={setNotificationFilter} onTask={showTask} /> : <Settings state={state} pending={pending} onSave={settings => perform('settings', () => api('/api/settings', settings), '运行设置已保存。').then(() => {})} onSession={(action, mode) => void sessionAction(action, mode).catch(() => {})} onEngine={engineAction} />}
+    </> : page === 'bookings' ? <Bookings state={state} filter={bookingFilter} onFilter={setBookingFilter} onTask={showTask} clearing={pending.has('clear-records')} onClear={() => clearRecords('bookings')} /> : page === 'notifications' ? <Notifications state={state} filter={notificationFilter} onFilter={setNotificationFilter} onTask={showTask} clearing={pending.has('clear-records')} onClear={() => clearRecords('notifications')} /> : <Settings state={state} pending={pending} onSave={settings => perform('settings', () => api('/api/settings', settings), '运行设置已保存。').then(() => {})} onSession={(action, mode) => void sessionAction(action, mode).catch(() => {})} onEngine={engineAction} onClear={() => clearRecords('all')} />}
     <footer className="page-footer">餐厅时间以韩国时间为准 · Asia/Seoul <span>比北京时间快 1 小时</span></footer>
-  </main><Activity state={state} />
+  </main><Activity state={state} clearing={pending.has('clear-records')} onClear={() => clearRecords('events')} />
     {modal ? <NewTaskModal interval={state?.settings.pollIntervalMs ?? 1000} currentDate={state?.engine.currentDate ?? '2026-10-12'} onClose={() => setModal(false)} onCreate={(task: NewTask) => perform('new-task', () => api('/api/tasks', task), '任务已创建，启动后开始检查。').then(() => {})} /> : null}
     {detailTask && state ? <TaskDetails key={detailTask.id} task={detailTask} state={state} onClose={() => setDetailTaskId(null)} onLogin={() => { setDetailTaskId(null); navigate('settings'); }} onRecords={() => { setDetailTaskId(null); navigate('bookings'); }} /> : null}
     {abandonTask ? <Modal title="确认没有完成预约" onClose={() => setAbandonTask(null)} busy={pending.has(abandonTask.id)}><p className="modal-subtitle">请先在 Catchtable 官方 My Dining 核对「{abandonTask.restaurantName}」确实没有预约。确认后，任务回到暂停状态；你可以再点击启动。</p><label className="consent"><input data-autofocus type="checkbox" checked={noReservation} onChange={event => setNoReservation(event.target.checked)} /><span>我已核对官方预约记录，确认没有这笔订单。</span></label><div className="modal-footer"><button type="button" className="button" disabled={pending.has(abandonTask.id)} onClick={() => setAbandonTask(null)}>取消</button><button type="button" className="button primary" disabled={!noReservation || pending.has(abandonTask.id)} onClick={() => { void perform(abandonTask.id, () => api(`/api/tasks/${encodeURIComponent(abandonTask.id)}/action`, { action: 'abandon', noReservationConfirmed: true }), '已记录为未预约，任务回到暂停状态。').then(() => setAbandonTask(null)).catch(() => {}); }}>{pending.has(abandonTask.id) ? '处理中…' : '确认未预约，任务回到暂停'}</button></div></Modal> : null}

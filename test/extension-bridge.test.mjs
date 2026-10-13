@@ -139,6 +139,19 @@ test('cookie/storage/browser-close commands and unrelated navigation fail before
   assert.equal(w.commands.length,before);
 });
 
+test('activating an owned page restores scoped focus emulation without touching unrelated tabs',async t=>{
+  const f=await fixture(t);const w=await worker(f);
+  await f.bridge.requestCDP('Target.setAutoAttach',{autoAttach:true,flatten:true});
+  const before=w.commands.length;
+  await assert.rejects(f.bridge.requestCDP('Page.bringToFront',{},'personal-session'));
+  assert.equal(w.commands.length,before);
+  await f.bridge.requestCDP('Page.bringToFront',{},'session-1');
+  assert.deepEqual(w.commands.slice(before).map(command=>({method:command.method,sessionId:command.sessionId,params:command.params})),[
+    {method:'Emulation.setFocusEmulationEnabled',sessionId:'session-1',params:{enabled:true}},
+    {method:'Page.bringToFront',sessionId:'session-1',params:{}},
+  ]);
+});
+
 test('response body access requires an observed official response; sensitive headers are removed',async t=>{
   const f=await fixture(t);const w=await worker(f);
   await f.bridge.requestCDP('Target.setAutoAttach',{autoAttach:true,flatten:true});
@@ -256,7 +269,7 @@ test('invalid hello and hello timeout retain their cause; successful hello clear
   await new Promise(done=>silent.once('close',done));
   assert.equal(f.bridge.state().lastIssue.code,'hello_timeout');
   const w=await worker(f);assert.equal(f.bridge.state().lastIssue,null);
-  w.socket.close();await until(()=>!f.bridge.state().connected);
+  w.socket.close();await until(()=>f.bridge.state().status==='disconnected');
   assert.equal(f.bridge.state().lastIssue.code,'worker_disconnected');
   assert.ok(!JSON.stringify(f.bridge.state()).includes(pairing));
 });

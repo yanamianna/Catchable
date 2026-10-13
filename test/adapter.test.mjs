@@ -45,6 +45,8 @@ test('restaurant URL accepts only a canonical international restaurant route', (
     ['https://www.catchtable.net/shop/zest', 'https://www.catchtable.net/shop/zest'],
     ['https://catchtable.net/shop/zest/', 'https://catchtable.net/shop/zest'],
     ['https://www.catchtable.net/en/shop/zest', 'https://www.catchtable.net/en/shop/zest'],
+    ['https://www.catchtable.net/zh-CN/explore/shop/lebom', 'https://www.catchtable.net/zh-CN/shop/lebom'],
+    ['https://www.catchtable.net/explore/shop/lebom/', 'https://www.catchtable.net/shop/lebom'],
     ['https://www.catchtable.net/ko-KR/shop/restaurant_123', 'https://www.catchtable.net/ko-KR/shop/restaurant_123'],
   ];
   for (const [input, expected] of cases) assert.equal(restaurantUrl(input), expected, input);
@@ -150,11 +152,13 @@ test('an enabled calendar day or empty time list does not prove availability', (
 });
 
 test('explicit sold out is unavailable only after full date and party context validation', () => {
-  const result = parseAvailability(snapshot({ buttons: [], text: 'Sold out' }), task);
-  assert.equal(result.status, 'unavailable');
-  assert.deepEqual(result.slots, []);
-  const wrongDate = parseAvailability(snapshot({ buttons: [], text: 'Sold out', selectedDateLabel: 'October 26, 2026' }), task);
-  assert.equal(wrongDate.status, 'unknown');
+  for (const text of ['Sold out', '此日期不提供在线预订。']) {
+    const result = parseAvailability(snapshot({ buttons: [], text }), task);
+    assert.equal(result.status, 'unavailable');
+    assert.deepEqual(result.slots, []);
+    const wrongDate = parseAvailability(snapshot({ buttons: [], text, selectedDateLabel: 'October 26, 2026' }), task);
+    assert.equal(wrongDate.status, 'unknown');
+  }
 });
 
 test('login pages are authentication failures rather than empty availability', () => {

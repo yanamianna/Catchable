@@ -2,6 +2,7 @@ export type Page = 'tasks' | 'bookings' | 'notifications' | 'settings';
 export type Source = 'live' | 'demo';
 export type BrowserChannel = 'chrome' | 'msedge';
 export type BrowserIntegration = 'extension' | 'dedicated';
+export type RecordKind = 'events' | 'notifications' | 'bookings' | 'all';
 export type TaskStatus = 'paused' | 'active' | 'auth_required' | 'backoff' | 'user_action_required' | 'awaiting_confirmation' | 'confirmed' | 'expired';
 export type Mode = 'notify' | 'assist' | 'auto';
 export interface Slot { date: string; time: string; partySize: number; seatType?: string; label?: string }
