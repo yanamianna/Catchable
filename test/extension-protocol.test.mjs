@@ -46,7 +46,8 @@ async function worker() {
     setInterval: (callback, duration) => timer(callback, duration, true), clearInterval: id => timers.delete(id),
   });
   runInContext(workerSource, context); await runInContext('ready', context);
-  const message = value => new Promise(done => chrome.runtime.onMessage.listeners[0](value, { id: chrome.runtime.id }, done));
+  const popupSender = { id: chrome.runtime.id, url: `chrome-extension://${chrome.runtime.id}/popup.html` };
+  const message = (value, sender = popupSender) => new Promise(done => chrome.runtime.onMessage.listeners[0](value, sender, done));
   const connect = async () => { assert.equal((await message({ type: 'connect', pairingCode: fixtureCode })).ok, true); const socket = sockets.at(-1); socket.open(); return socket; };
   let commandId = 0;
   const command = async (method, params = {}, sessionId, socket = sockets.at(-1)) => {
@@ -63,7 +64,7 @@ async function worker() {
     const attached = sockets.at(-1).sent.findLast(value => value.method === 'Target.attachedToTarget' && value.params.targetInfo.targetId === targetId);
     return { targetId, tabId, sessionId: attached.params.sessionId };
   };
-  return { context, chrome, tabs, calls, sockets, timers, connect, command, create, message };
+  return { context, chrome, tabs, calls, sockets, timers, connect, command, create, message, popupSender };
 }
 
 test('extension has only the declared local transport and browser-control permissions', () => {
@@ -72,7 +73,10 @@ test('extension has only the declared local transport and browser-control permis
   assert.equal(manifest.manifest_version, 3); assert.equal(manifest.minimum_chrome_version, '125');
   assert.ok(!manifest.permissions.includes('cookies'));
   assert.ok(manifest.content_security_policy.extension_pages.includes('connect-src ws://127.0.0.1:4174'));
-  assert.ok(!manifest.content_scripts && !manifest.externally_connectable);
+  assert.ok(!manifest.externally_connectable);
+  assert.equal(manifest.content_scripts.length, 1);
+  assert.deepEqual(manifest.content_scripts[0].matches, ['http://127.0.0.1:4174/*', 'http://localhost:4174/*', 'http://127.0.0.1:4173/*', 'http://localhost:4173/*']);
+  assert.equal(manifest.content_scripts[0].all_frames, false);
 });
 
 test('pairing uses the fixed local WebSocket endpoint and keeps the code out of status', async () => {
@@ -90,11 +94,102 @@ test('pairing uses the fixed local WebSocket endpoint and keeps the code out of 
   assert.equal(keepalive.duration, 20000); keepalive.callback(); assert.equal(socket.sent.at(-1).type, 'ping');
 });
 
+const consoleSender = { id: 'fixture-extension', url: 'http://127.0.0.1:4174/', tab: { id: 99, url: 'http://127.0.0.1:4174/' }, frameId: 0 };
+const tick = () => new Promise(done => setImmediate(done));
+async function acknowledge(socket, accountId = 'default', accountLabel = 'Account A') {
+  socket.open();
+  await socket.onmessage({ data: JSON.stringify({ type: 'hello_ack', accountId, accountLabel }) });
+}
+
+test('one-click accepts eight digits, waits for real acknowledgement and preserves a connected account', async () => {
+  const fixture = await worker();
+  let settled = false;
+  const connecting = fixture.message({ type: 'connect', pairingCode: '12345678', accountId: 'default' }, consoleSender).then(value => { settled = true; return value; });
+  await tick(); const socket = fixture.sockets.at(-1);
+  assert.equal(socket.protocols[1], 'pair.12345678');
+  socket.open(); await tick(); assert.equal(settled, false);
+  assert.equal((await fixture.message({ type: 'status' })).status, 'connecting');
+  await socket.onmessage({ data: JSON.stringify({ type: 'hello_ack', accountId: 'default', accountLabel: 'Account A' }) });
+  const connected = await connecting;
+  assert.equal(connected.ok, true); assert.equal(connected.status, 'connected'); assert.equal(connected.accountId, 'default');
+  const owned = await fixture.create();
+  const repeated = await fixture.message({ type: 'connect', pairingCode: '87654321', accountId: 'default' }, consoleSender);
+  assert.equal(repeated.ok, true); assert.equal(fixture.sockets.length, 1);
+  assert.equal(repeated.ownedTabs, 1); assert.equal(repeated.attachedTabs, 1);
+  assert.equal(fixture.calls.filter(call => call.api === 'detach').length, 0);
+  assert.ok((await fixture.command('Target.getTargetInfo', { targetId: owned.targetId })).result);
+  assert.equal(fixture.chrome.storage.local.values.boundAccountId, 'default');
+  assert.ok(!JSON.stringify(repeated).includes('12345678'));
+});
+
+test('a different account requires explicit confirmation and switches without adopting prior tabs', async () => {
+  const fixture = await worker(); await fixture.connect();
+  const original = fixture.sockets.at(-1);
+  await original.onmessage({ data: JSON.stringify({ type: 'hello_ack', accountId: 'default', accountLabel: 'Account A' }) });
+  const owned = await fixture.create();
+  const request = { type: 'connect', pairingCode: '12345678', accountId: 'second' };
+  const conflict = await fixture.message(request, consoleSender);
+  assert.equal(conflict.ok, false); assert.equal(conflict.code, 'ACCOUNT_CONFLICT'); assert.equal(conflict.accountLabel, 'Account A');
+  assert.equal(fixture.sockets.length, 1); assert.equal(original.closed, undefined);
+  const change = fixture.message({ ...request, force: true }, consoleSender);
+  await tick(); assert.equal(fixture.sockets.length, 2);
+  const next = fixture.sockets.at(-1); await acknowledge(next, 'second', 'Account B');
+  assert.equal((await change).ok, true); assert.equal(original.closed, true);
+  assert.ok(fixture.tabs.has(owned.tabId)); assert.equal((await fixture.command('Target.getTargets')).result.targetInfos.length, 0);
+  assert.equal(fixture.chrome.storage.local.values.boundAccountId, 'second');
+});
+
+test('one-click rejects a mismatched or missing acknowledged account and serializes competing connects', async () => {
+  const fixture = await worker();
+  const first = fixture.message({ type: 'connect', pairingCode: '12345678', accountId: 'default' }, consoleSender);
+  const second = fixture.message({ type: 'connect', pairingCode: '87654321', accountId: 'second' }, consoleSender);
+  await tick(); assert.equal(fixture.sockets.length, 1);
+  await acknowledge(fixture.sockets[0], 'default');
+  assert.equal((await first).ok, true); assert.equal((await second).code, 'ACCOUNT_CONFLICT'); assert.equal(fixture.sockets.length, 1);
+  const wrong = await worker();
+  const pending = wrong.message({ type: 'connect', pairingCode: '12345678', accountId: 'default' }, consoleSender);
+  await tick(); wrong.sockets[0].open();
+  // Explicitly simulate an older server without accountId.
+  await wrong.sockets[0].onmessage({ data: JSON.stringify({ type: 'hello_ack', accountLabel: 'Unknown' }) });
+  const result = await pending;
+  assert.equal(result.ok, false); assert.equal(result.code, 'ACCOUNT_MISMATCH');
+});
+
+test('worker accepts only its own popup or a top-level local console and limits console commands', async () => {
+  const fixture = await worker(); const listener = fixture.chrome.runtime.onMessage.listeners[0];
+  for (const sender of [
+    { id: 'another-extension', url: fixture.popupSender.url },
+    { id: fixture.chrome.runtime.id },
+    { ...consoleSender, frameId: 2 },
+    { ...consoleSender, url: 'https://www.catchtable.net/' },
+    { ...consoleSender, tab: { id: 99, url: 'http://evil.invalid:4174/' } },
+    { ...consoleSender, url: 'http://127.0.0.1:8888/' },
+  ]) assert.equal(listener({ type: 'connect', pairingCode: '12345678' }, sender, () => assert.fail('invalid sender was accepted')), false);
+  assert.equal(listener({ type: 'disconnect' }, consoleSender, () => assert.fail('console cannot disconnect')), false);
+  assert.equal(listener({ type: 'open_console' }, consoleSender, () => assert.fail('console cannot create arbitrary tabs')), false);
+  assert.equal(fixture.sockets.length, 0);
+});
+
+test('one-click timeout reports incomplete connection and a retry can complete after the actual acknowledgement', async () => {
+  const fixture = await worker();
+  const request = { type: 'connect', pairingCode: '12345678', accountId: 'default' };
+  const first = fixture.message(request, consoleSender);
+  await tick(); const socket = fixture.sockets[0]; socket.open();
+  const waiting = [...fixture.timers.values()].find(timer => !timer.interval && timer.duration === 6000);
+  assert.ok(waiting); waiting.callback();
+  const timedOut = await first; assert.equal(timedOut.ok, false); assert.equal(timedOut.code, 'CONNECTION_TIMEOUT');
+  const retry = fixture.message(request, consoleSender);
+  await tick(); assert.equal(fixture.sockets.length, 1);
+  await socket.onmessage({ data: JSON.stringify({ type: 'hello_ack', accountId: 'default', accountLabel: 'Account A' }) });
+  assert.equal((await retry).ok, true);
+});
+
 test('server account labels are displayed safely and switching pairing never adopts the previous account tabs',async()=>{
   const fixture=await worker();const socket=await fixture.connect();const owned=await fixture.create();
   await socket.onmessage({data:JSON.stringify({type:'hello_ack',accountLabel:'Synthetic account A'})});
   assert.equal((await fixture.message({type:'status'})).accountLabel,'Synthetic account A');
-  await fixture.message({type:'connect',pairingCode:'different_fixture_pairing_0123456789'});
+  assert.equal((await fixture.message({type:'connect',pairingCode:'different_fixture_pairing_0123456789'})).code,'ACCOUNT_CONFLICT');
+  await fixture.message({type:'connect',pairingCode:'different_fixture_pairing_0123456789',force:true});
   const next=fixture.sockets.at(-1);next.open();
   assert.equal((await fixture.message({type:'status'})).accountLabel,null);
   assert.ok(fixture.tabs.has(owned.tabId),'switching account preserves its former tabs');
@@ -177,6 +272,25 @@ test('network events retain Playwright response status while stripping cookies, 
   assert.ok(!JSON.stringify([request, response]).includes('fixture-secret'));
 });
 
+test('download chunk bursts are not transported while request, response, body and completion evidence remain intact', async () => {
+  const fixture = await worker(); const socket = await fixture.connect(); const owned = await fixture.create();
+  const source = { tabId: owned.tabId };
+  const requestId = 'chunked-account';
+  const url = 'https://api.catchtable.net/api/v5/user/info';
+  fixture.chrome.debugger.onEvent.fire(source, 'Network.requestWillBeSent', { requestId, request: { url, headers: {} } });
+  fixture.chrome.debugger.onEvent.fire(source, 'Network.responseReceived', { requestId, response: { url, status: 200, headers: {} } });
+  const before = socket.sent.length;
+  for (let i = 0; i < 10000; i++) fixture.chrome.debugger.onEvent.fire(source, 'Network.dataReceived', {
+    requestId, timestamp: i, dataLength: 1024, encodedDataLength: 512,
+  });
+  assert.equal(socket.sent.length - before, 0, '10,000 progress chunks must send no transport frames');
+  fixture.chrome.debugger.onEvent.fire(source, 'Network.loadingFinished', { requestId, timestamp: 10001, encodedDataLength: 5120000 });
+  assert.deepEqual(socket.sent.filter(value => value.params?.requestId === requestId).map(value => value.method), [
+    'Network.requestWillBeSent', 'Network.responseReceived', 'Network.loadingFinished',
+  ]);
+  assert.equal((await fixture.command('Network.getResponseBody', { requestId }, owned.sessionId)).result.body, '{"fixture":true}');
+});
+
 test('response bodies require observed official normal responses and exclude authentication endpoints', async () => {
   const fixture = await worker(); await fixture.connect(); const owned = await fixture.create();
   assert.ok((await fixture.command('Network.getResponseBody', { requestId: 'unknown' }, owned.sessionId)).error);
@@ -219,6 +333,52 @@ test('user debugger detachment stops the local connection without closing or rec
   assert.ok(socket.sent.some(value => value.method === 'Inspector.detached' && value.sessionId === owned.sessionId));
   assert.equal((await fixture.message({ type: 'status' })).enabled, false); assert.equal(socket.closed, true);
   assert.ok(fixture.tabs.has(1) && fixture.tabs.has(owned.tabId)); assert.ok(!fixture.calls.some(value => value.api === 'remove'));
+});
+
+test('closing one owned page removes only its session and keeps the profile connection and other pages usable', async () => {
+  const fixture = await worker(); const socket = await fixture.connect();
+  const closing = await fixture.create(); const remaining = await fixture.create();
+  // Chrome may emit debugger detachment before the corresponding tabs.onRemoved.
+  fixture.chrome.debugger.onDetach.fire({ tabId: closing.tabId }, 'target_closed');
+  fixture.tabs.delete(closing.tabId); fixture.chrome.tabs.onRemoved.fire(closing.tabId);
+  await tick();
+  const state = await fixture.message({ type: 'status' });
+  assert.equal(state.enabled, true); assert.equal(state.attachedTabs, 1);
+  assert.equal(socket.closed, undefined);
+  assert.ok((await fixture.command('Runtime.evaluate', { expression: 'document.body.innerText' }, remaining.sessionId)).result);
+  assert.equal((await fixture.command('Target.getTargets')).result.targetInfos.length, 1);
+});
+
+test('an asynchronous reconnect preparation cannot create a socket after explicit disconnection', async () => {
+  const fixture = await worker(); const first = await fixture.connect();
+  await first.serverClose();
+  const originalGet = fixture.chrome.storage.local.get;
+  let release;
+  fixture.chrome.storage.local.get = key => key === 'pairingCode'
+    ? new Promise(done => { release = () => done({ pairingCode: fixtureCode }); }) : originalGet(key);
+  const reconnect = [...fixture.timers.values()].find(value => !value.interval);
+  assert.ok(reconnect); reconnect.callback(); await tick(); assert.equal(typeof release, 'function');
+  assert.equal((await fixture.message({ type: 'disconnect' })).ok, true);
+  release(); await tick();
+  assert.equal(fixture.sockets.length, 1, 'a stale storage read must not reopen an explicitly disconnected connection');
+  assert.equal((await fixture.message({ type: 'status' })).enabled, false);
+});
+
+test('manual reconnect waits for earlier disconnect cleanup and is not overwritten by its stale close handler', async () => {
+  const fixture = await worker(); const first = await fixture.connect(); await fixture.create();
+  const originalDetach = fixture.chrome.debugger.detach;
+  let release;
+  fixture.chrome.debugger.detach = target => new Promise(done => { release = async () => { await originalDetach(target); done(); }; });
+  const disconnected = first.serverClose(); await tick(); assert.equal(typeof release, 'function');
+  const reconnect = fixture.message({ type: 'connect', pairingCode: fixtureCode });
+  await tick(); assert.equal(fixture.sockets.length, 1);
+  await release(); await disconnected;
+  assert.equal((await reconnect).ok, true);
+  const second = fixture.sockets.at(-1); await acknowledge(second);
+  const state = await fixture.message({ type: 'status' });
+  assert.equal(state.status, 'connected'); assert.equal(state.enabled, true);
+  assert.equal(fixture.sockets.length, 2);
+  assert.equal([...fixture.timers.values()].filter(value => !value.interval).length, 0, 'the old close handler must not schedule an extra connection');
 });
 
 test('an older programmatic detach cannot hide a user stopping a newly attached session', async () => {

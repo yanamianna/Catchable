@@ -67,7 +67,9 @@ async function worker(f,handler) {
   const result=(command,value={})=>socket.send(JSON.stringify({type:'result',id:command.id,result:value}));
   const event=(method,params,sessionId)=>socket.send(JSON.stringify({type:'event',method,params,...(sessionId?{sessionId}:{})}));
   socket.on('message',data=>{
-    const command=JSON.parse(data.toString());commands.push(command);
+    const command=JSON.parse(data.toString());
+    if(command.type==='hello_ack')return;
+    commands.push(command);
     if(handler)handler(command,{result,event,socket});
     else if(command.method==='Target.setAutoAttach') { event('Target.attachedToTarget',{sessionId:'session-1',targetInfo:target,waitingForDebugger:false});result(command); }
     else if(command.method==='Target.getTargets')result(command,{targetInfos:[target]});
@@ -105,6 +107,16 @@ test('extension upgrade requires exact extension origin and pairing protocol',as
   assert.ok(!JSON.stringify(f.bridge.state()).includes(pairing));
   assert.equal(await refused(f.bridge.getCdpEndpoint(),undefined,{origin:'http://127.0.0.1:4174'}),403);
   assert.equal(await refused(f.bridge.getCdpEndpoint().replace(/\/cdp\/.+$/,'/cdp/wrong'),undefined),403);
+});
+
+test('a standalone bridge always acknowledges its stable default account before any CDP command',async t=>{
+  const f=await fixture(t);
+  const socket=await connect(f.workerUrl,['catchable',`pair.${pairing}`],{origin:extensionOrigin});
+  const received=[];socket.on('message',data=>received.push(JSON.parse(data.toString())));
+  socket.send(JSON.stringify(hello));
+  await until(()=>received.length>0);
+  assert.deepEqual(received,[{type:'hello_ack',accountId:'default',accountLabel:null}]);
+  assert.equal(f.bridge.state().connected,true);
 });
 
 test('only localhost UI can obtain pairing; GET state never exposes secrets',async t=>{
@@ -164,6 +176,44 @@ test('response body access requires an observed official response; sensitive hea
   await assert.rejects(f.bridge.requestCDP('Network.getResponseBody',{requestId:'auth-fixture'},'session-1'));
   const cleaned=redactExtensionPayload({request:{headers:{Cookie:'synthetic-secret',Authorization:'synthetic-secret',Accept:'application/json'},postData:'synthetic-private'},response:{headers:{'Set-Cookie':'synthetic-secret',Date:'fixture'}},associatedCookies:[{cookie:{value:'synthetic-secret'}}],statusCode:200});
   assert.deepEqual(cleaned,{request:{headers:{Accept:'application/json'}},response:{headers:{Date:'fixture'}},statusCode:200});
+});
+
+test('detaching a root or destroying a target invalidates descendant sessions and releases their observed bodies',async t=>{
+  const f=await fixture(t);const w=await worker(f);
+  await f.bridge.requestCDP('Target.setAutoAttach',{autoAttach:true});
+  const attachChild=(id,parent='session-1')=>w.event('Target.attachedToTarget',{
+    sessionId:id,targetInfo:{...target,targetId:`iframe-${id}`,type:'iframe'},waitingForDebugger:false,
+  },parent);
+  const observe=(sessionId,requestId)=>w.event('Network.responseReceived',{
+    requestId,response:{url:'https://api.catchtable.net/api/v5/user/info',status:200},
+  },sessionId);
+  attachChild('child');attachChild('grandchild','child');
+  observe('session-1','root-response');observe('child','child-response');observe('grandchild','grandchild-response');
+  await delay(10);
+  await f.bridge.requestCDP('Network.getResponseBody',{requestId:'root-response'},'session-1');
+  await f.bridge.requestCDP('Network.getResponseBody',{requestId:'grandchild-response'},'grandchild');
+  w.event('Target.detachedFromTarget',{sessionId:'child',targetId:'iframe-child'},'session-1');
+  await delay(10);const before=w.commands.length;
+  for(const sessionId of ['child','grandchild']) {
+    await assert.rejects(f.bridge.requestCDP('Runtime.evaluate',{expression:'document.title'},sessionId),error=>error.code==='EXTENSION_TARGET_BLOCKED');
+    await assert.rejects(f.bridge.requestCDP('Target.getTargetInfo',{targetId:`iframe-${sessionId}`}));
+  }
+  assert.equal(w.commands.length,before,'closed child sessions never reach the worker');
+  await f.bridge.requestCDP('Network.getResponseBody',{requestId:'root-response'},'session-1');
+  // Reusing a detached session ID must not revive any body permission.
+  attachChild('child');await delay(10);
+  await assert.rejects(f.bridge.requestCDP('Network.getResponseBody',{requestId:'child-response'},'child'),error=>error.code==='EXTENSION_COMMAND_BLOCKED');
+  observe('child','active-child-response');await delay(10);
+  await f.bridge.requestCDP('Network.getResponseBody',{requestId:'active-child-response'},'child');
+  w.event('Target.detachedFromTarget',{sessionId:'session-1',targetId:target.targetId});
+  await delay(10);
+  await assert.rejects(f.bridge.requestCDP('Runtime.evaluate',{expression:'document.title'},'child'),error=>error.code==='EXTENSION_TARGET_BLOCKED');
+  // Detach leaves the owned page available for a fresh debugger attachment.
+  await f.bridge.requestCDP('Target.getTargetInfo',{targetId:target.targetId});
+  w.event('Target.attachedToTarget',{sessionId:'new-root',targetInfo:target,waitingForDebugger:false});
+  attachChild('new-child','new-root');await delay(10);
+  w.event('Target.targetDestroyed',{targetId:target.targetId});await delay(10);
+  for(const sessionId of ['new-root','new-child'])await assert.rejects(f.bridge.requestCDP('Runtime.evaluate',{expression:'document.title'},sessionId),error=>error.code==='EXTENSION_TARGET_BLOCKED');
 });
 
 test('timeouts and disconnect fail pending commands without replaying writes',async t=>{

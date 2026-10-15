@@ -95,7 +95,7 @@ test('shipped worker + Node bridge + real Playwright page produce DOM and fresh 
   }
   const context=vm.createContext({chrome,WebSocket:LocalWorkerWebSocket,navigator:{userAgent:'Mozilla/5.0 Chrome/150.0.0.0 Safari/537.36'},URL,setTimeout,clearTimeout,setInterval,clearInterval,console:{log(){},error(){},warn(){}}});
   vm.runInContext(await readFile(new URL('../extension/service-worker.js',import.meta.url),'utf8'),context,{filename:'isolated-service-worker-fixture.js'});
-  async function message(value){return new Promise(done=>{assert.equal(events.runtime.listeners.length,1);events.runtime.listeners[0](value,{id:chrome.runtime.id},done);});}
+  async function message(value){return new Promise(done=>{assert.equal(events.runtime.listeners.length,1);events.runtime.listeners[0](value,{id:chrome.runtime.id,url:`chrome-extension://${chrome.runtime.id}/popup.html`},done);});}
   let remoteBrowser;
   t.after(async()=>{
     await message({type:'disconnect'}).catch(()=>{});

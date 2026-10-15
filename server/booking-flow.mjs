@@ -161,3 +161,58 @@ export async function fillReservationName(page,snapshot,fullName) {
     return await locator.inputValue()===fullName.trim()?'filled':'blocked';
   }catch{return 'blocked';}
 }
+
+// Compare phone values privately, including a website's existing prefill. Only
+// the current reservation form's unique, labelled telephone input is editable.
+// The caller receives a state, never the actual number or country-picker text.
+export async function fillReservationPhone(page,contact,{onStep=()=>{}}={}) {
+  const step=value=>onStep(value);
+  const digits=value=>typeof value==='string' && /^[\d\s()-]*$/.test(value)?value.replace(/[\s()-]/g,''):null;
+  step('configuration');
+  if(typeof contact?.countryCode!=='string' || typeof contact?.phoneNumber!=='string'
+    || !/^\+[1-9]\d{0,2}$/.test(contact.countryCode) || !/^\d{4,20}$/.test(contact.phoneNumber))return 'blocked';
+  try {
+    if(officialReservationRoute(page.url())?.kind!=='form')return 'blocked';
+    step('phone_field');
+    const phone=page.locator('input[type="tel"]:visible');
+    const count=await phone.count();
+    if(count===0)return 'absent';
+    if(count!==1 || !await phone.isVisible())return 'blocked';
+    const recognised=await phone.evaluate(element=>{
+      const labels=[element.getAttribute('aria-label'),element.getAttribute('placeholder'),
+        ...Array.from(element.labels || [],label=>label.innerText),element.closest('section')?.querySelector('h3')?.innerText].filter(Boolean);
+      return /^(?:tel|tel-national)$/.test(element.autocomplete || '')
+        || /^(?:phone|phone_?number|mobile|mobile_?number|telephone|tel)$/i.test(element.name || '')
+        || labels.some(label=>/(?:电话号码|手机号码|联系电话|Phone(?:\s+number)?|Telephone|Mobile(?:\s+number)?|전화번호|연락처)/i.test(label));
+    });
+    if(!recognised)return 'blocked';
+    const country=phone.locator('xpath=preceding-sibling::div[1]');
+    step('country_control');
+    if(await country.count()!==1 || !await country.isVisible())return 'blocked';
+    const originalCountry=(await country.innerText()).trim();
+    const originalNumber=digits(await phone.inputValue());
+    if(originalCountry===contact.countryCode && originalNumber===contact.phoneNumber)return 'ready';
+    if(!await phone.isEditable())return 'blocked';
+    if(originalCountry!==contact.countryCode) {
+      await country.click();
+      const search=page.getByPlaceholder(/^(?:搜索|Search)$/i);
+      step('country_search');
+      if(!await search.waitFor({state:'visible',timeout:5000}).then(()=>true,()=>false))return 'blocked';
+      if(await search.count()!==1 || !await search.isVisible())return 'blocked';
+      await search.fill(contact.countryCode);
+      const code=contact.countryCode.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+      const option=page.getByRole('button').filter({has:page.locator('span').filter({hasText:new RegExp(`^${code}$`)})});
+      step('country_option');
+      if(!await option.waitFor({state:'visible',timeout:5000}).then(()=>true,()=>false))return 'blocked';
+      if(await option.count()!==1 || !await option.isEnabled())return 'blocked';
+      await option.click();
+      step('country_close');
+      if(!await search.waitFor({state:'hidden',timeout:5000}).then(()=>true,()=>false))return 'blocked';
+      step('country_verify');
+      if((await country.innerText()).trim()!==contact.countryCode)return 'blocked';
+    }
+    if(digits(await phone.inputValue())!==contact.phoneNumber)await phone.fill(contact.phoneNumber);
+    step('phone_verify');
+    return digits(await phone.inputValue())===contact.phoneNumber && (await country.innerText()).trim()===contact.countryCode?'filled':'blocked';
+  }catch{return 'blocked';}
+}

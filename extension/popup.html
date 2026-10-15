@@ -6,14 +6,16 @@
     <div class="brand"><span class="mark">C</span><div><h1>Catchable</h1><p>连接当前 Chrome 登录会话</p></div></div>
     <section class="connection" aria-live="polite"><span id="status-dot" class="dot"></span><div><strong id="status-label">尚未连接</strong><p id="status-message">正在读取连接状态…</p></div></section>
     <p id="account-label" class="hint" hidden></p>
-    <form id="connect-form">
-      <label for="pairing-code">本地配对码</label>
-      <input id="pairing-code" type="password" autocomplete="off" spellcheck="false" placeholder="从本地控制台复制后粘贴" maxlength="128">
-      <p class="hint">从控制台的「登录设置」复制配对码。</p>
-      <div class="actions"><button id="connect" type="submit">连接本地系统</button><button id="disconnect" type="button" class="secondary">断开</button></div>
-    </form>
-    <button id="open-console" class="console" type="button">打开本地控制台 <span aria-hidden="true">↗</span></button>
-    <p class="scope">连接后在控制台核验登录，再启动任务。</p>
+    <button id="open-console" class="console" type="button">打开控制台，一键连接 <span aria-hidden="true">↗</span></button>
+    <details id="manual-pairing"><summary>使用配对码连接</summary><form id="connect-form">
+      <label for="pairing-code">8 位数字配对码</label>
+      <input id="pairing-code" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="例如 12345678" maxlength="128">
+      <p class="hint">旧版配对码也可以继续使用。</p>
+      <button id="connect" type="submit">连接</button>
+    </form></details>
+    <div id="replace-binding" class="replace" hidden><p id="replace-message"></p><button id="confirm-replace" type="button">确认更换绑定</button><button id="cancel-replace" type="button" class="secondary">取消</button></div>
+    <button id="disconnect" type="button" class="secondary">断开连接</button>
+    <p class="scope">每个 Chrome 资料连接一次，以后自动重连。</p>
     <p id="error" class="error" role="alert" hidden></p>
   </main>
   <script src="popup.js"></script>

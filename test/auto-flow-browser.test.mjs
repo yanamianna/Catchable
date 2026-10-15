@@ -55,7 +55,7 @@ function formHtml() {
       host.querySelector('button').onclick=async()=>{await window.fixtureTrack('country-select');country.querySelector('span').textContent='+86';host.querySelector('input').value='';setTimeout(()=>{host.innerHTML=''},300)};
     };
     phone.oninput=async()=>{await window.fixtureTrack('phone-filled');document.querySelector('#checkout').disabled=!phone.value.trim()};
-    document.querySelector('#checkout').onclick=async()=>{await window.fixtureTrack('checkout-click');await fetch('https://api.catchtable.net/api/v5/reservation/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fixture:true})});location.assign('${detailPath}')};
+    document.querySelector('#checkout').onclick=async()=>{await window.fixtureTrack('checkout-click',{phone:phone.value,country:country.innerText});await fetch('https://api.catchtable.net/api/v5/reservation/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fixture:true})});location.assign('${detailPath}')};
   </script></body></html>`;
 }
 function detailHtml() {
@@ -73,9 +73,9 @@ test('offline browser completes calendar filter, visible-text shop slot, nested 
   const context = await browser.newContext({ locale: 'zh-CN', timezoneId: 'Asia/Seoul' });
   const trace = []; const external = []; const pageErrors = [];
   let persisted = false; let persistCount = 0; let createCount = 0; let pending = true;
-  let signedIn=true;
+  let signedIn=true;let submittedContact=null;
   let simulatedLostClickAcknowledgement=false;
-  await context.exposeBinding('fixtureTrack', (_source, event) => { trace.push(event); });
+  await context.exposeBinding('fixtureTrack', (_source, event, contact) => { trace.push(event);if(event==='checkout-click')submittedContact=contact; });
   context.on('page', page => {
     page.on('pageerror', error => pageErrors.push(error.message));
     const locator=page.locator.bind(page);
@@ -127,11 +127,13 @@ test('offline browser completes calendar filter, visible-text shop slot, nested 
   assert.equal(initial.submitted,false);assert.deepEqual(initial.diagnostics.missingRequiredFields,['电话号码']);
   assert.equal(createCount,0);assert.equal(persistCount,0,'an empty mandatory phone must not reach the write boundary');
   assert.equal(simulatedLostClickAcknowledgement,true,'an already opened next step must survive a lost slot-click acknowledgement');
+  await adapter.bookingPages.get(task.id).locator('input[type="tel"]').evaluate(element=>{element.value='2025550199';});
   const result = await adapter.continueAttempt({id:'offline-attempt',taskSnapshot:task,slot,status:initial.status,phase:initial.phase,submitted:false},
     {onBeforeSubmit,bookingContact:{countryCode:'+86',phoneNumber:'13800000000',fullName:'Offline Authorized Guest'}});
   assert.equal(result.status, 'pending_restaurant', JSON.stringify({ result, trace, pageErrors }));
   assert.equal(result.reservationId, id);
   assert.equal(persistCount, 1); assert.equal(createCount, 1);
+  assert.deepEqual(submittedContact,{country:'+86',phone:'13800000000'},'an existing website prefill must not override the original attempt contact');
   for (const event of ['calendar-filter-slot', 'main-slot-open', 'promo-later', 'same-day-next', 'notice-request', 'name-filled', 'country-open', 'country-select', 'phone-filled', 'checkout-click']) assert.equal(trace.filter(value => value === event).length, 1, event);
   assert.ok(identityChecks>=3,'booking form and independent official order pages each validate the bound account identity');
   assert.ok(!JSON.stringify(result).includes('Offline Authorized Guest'));

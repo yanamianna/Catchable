@@ -163,7 +163,18 @@ export function slotKey(slot) {
 
 export function safeMessage(error, fallback = '操作暂时未能完成，请查看运行记录。') {
   const message = typeof error === 'string' ? error : error?.message;
-  return message ? String(message).replace(/https?:\/\/[^\s]+/g, '[网址]').slice(0, 500) : fallback;
+  if (!message) return fallback;
+  const plain = String(message).replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+  const first = plain.split(/\r?\n|Call log:/, 1)[0].trim();
+  if (/net::ERR_NETWORK_ACCESS_DENIED/.test(first)) return '浏览器阻止了网络访问，请确认当前 Chrome 可以打开官网后重试。';
+  if (/net::ERR_INTERNET_DISCONNECTED/.test(first)) return '当前网络未连接，请恢复网络后重试。';
+  if (/net::ERR_NAME_NOT_RESOLVED/.test(first)) return '暂时无法解析网站地址，请检查网络后重试。';
+  if (/net::ERR_(?:PROXY_CONNECTION_FAILED|TUNNEL_CONNECTION_FAILED)/.test(first)) return '浏览器代理连接失败，请检查代理设置后重试。';
+  if (/net::ERR_(?:CONNECTION_(?:CLOSED|RESET|REFUSED|ABORTED|TIMED_OUT)|TIMED_OUT|NETWORK_CHANGED)/.test(first)) return '网站连接中断，请稍后重试。';
+  if (/net::ERR_BLOCKED_BY_CLIENT/.test(first)) return '页面请求被浏览器或扩展拦截，请检查后重试。';
+  if (/Target (?:page, context or browser|closed)|browser has been closed|Session closed\./i.test(first)) return '浏览器页面或连接已关闭，请重新连接后重试。';
+  if (error?.name === 'TimeoutError' || /(?:page|locator)\.[A-Za-z]+: Timeout \d+ms exceeded/.test(first)) return '操作等待超时，请稍后重试。';
+  return first.replace(/(?:https?|wss?):\/\/[^\s]+/g, '[网址]').replace(/^(?:page|browser|browserContext|locator)\.[A-Za-z]+:\s*/, '').slice(0, 500) || fallback;
 }
 
 export function publicAddress(address) {

@@ -80,6 +80,16 @@ test('all and explicit account state tag resources while private fingerprints st
   }
 }));
 
+test('login totals exclude disconnected extensions even while the last official session result is cached', () => fixture(async ({ c, broker, send, addAccount }) => {
+  const second = await addAccount();
+  for (const id of ['default', second.id]) c.engine(id).applySession({ status: 'authenticated', accountLabel: 'Synthetic authenticated account' });
+  assert.equal((await send('/api/state')).json.engine.authenticatedAccounts, 0);
+  broker.state = id => ({ connected: id === second.id, status: id === second.id ? 'connected' : 'disconnected' });
+  assert.equal((await send('/api/state')).json.engine.authenticatedAccounts, 1);
+  broker.state = () => ({ connected: false, status: 'disconnected' });
+  assert.equal((await send('/api/state')).json.engine.authenticatedAccounts, 0);
+}));
+
 test('task mutations require the explicit matching account and each account independently accepts five tasks', () => fixture(async ({ send, post, origin, addAccount, addTask, store }) => {
   const second = await addAccount();
   const task = await addTask(second.id);
@@ -125,6 +135,18 @@ test('account pairing codes require the existing same-origin read guard and neve
   assert.equal(trusted.json.accountId, second.id);
   assert.equal((await send('/api/extension/pairing', { headers: { referer: `${origin}/`, 'sec-fetch-site': 'same-origin' } })).json.accountId, 'default');
   assert.equal(JSON.stringify((await send('/api/state')).json).includes('fixture-only-pairing'), false);
+}));
+
+test('account pairing endpoints prefer short plaintext codes while the default compatibility endpoint retains its original credential', () => fixture(async ({ send, origin, broker, addAccount }) => {
+  const second = await addAccount();
+  broker.simplePairingInfo = id => ({ pairingCode: id === 'default' ? '01234567' : '87654321', extensionPath: 'fixture-extension' });
+  const headers = { origin, 'sec-fetch-site': 'same-origin' };
+  const response = await send(`/api/accounts/${second.id}/pairing`, { headers });
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.json, { pairingCode: '87654321', extensionPath: 'fixture-extension' });
+  assert.equal((await send('/api/accounts/default/pairing', { headers })).json.pairingCode, '01234567');
+  assert.equal((await send('/api/extension/pairing', { headers })).json.pairingCode, 'fixture-only-pairing-default');
+  assert.ok(!JSON.stringify((await send('/api/state')).json).includes('87654321'));
 }));
 
 test('public account edits validate contacts but original booking contacts remain frozen and fingerprints stay private', () => fixture(async ({ store, c, send, post, addAccount }) => {

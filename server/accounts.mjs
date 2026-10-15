@@ -132,7 +132,8 @@ export class AccountCoordinator {
         accountWriteBlocked:runtimes.some(value=>value.accountWriteBlocked),currentDate:localDate(this.now()),
         currentTaskId:scope==='all'?null:runtimes[0].currentTaskId,queuedActions:runtimes.reduce((sum,value)=>sum+(value.queuedActions||0),0),
         accountCount:accounts.length,connectedAccounts:accounts.filter(account=>account.extension.connected).length,
-        authenticatedAccounts:accounts.filter(account=>account.session.status==='authenticated').length,
+        authenticatedAccounts:accounts.filter(account=>account.session.status==='authenticated'
+          && (account.settings.browserIntegration!=='extension' || account.extension.connected)).length,
         processMemoryMB:Math.round(process.memoryUsage().rss/1048576),systemFreeMemoryMB:Math.round(os.freemem()/1048576)},stats};
   }
   createTask(input) {

@@ -22,7 +22,7 @@ export async function accountApi({coordinator:c,url,method,body,request,port}) {
     if(action==='action' && method==='POST')return {value:c.accountAction(id,body.action)};
     if(action==='pairing' && method==='GET') {
       if(!trustedPairingRead(request,port))throw new HttpError(403,'配对信息只能从本机系统页面读取。');
-      return {value:c.broker.pairingInfo(id)};
+      return {value:typeof c.broker.simplePairingInfo==='function'?c.broker.simplePairingInfo(id):c.broker.pairingInfo(id)};
     }
     if(action?.startsWith('session/') && method==='POST')return {value:await c.engine(id).sessionAction(action.endsWith('open')?'open':'check',body)};
   }

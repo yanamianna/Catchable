@@ -17,8 +17,13 @@ let sequence = 0;
 let retryCount = 0;
 let reconnectTimer = null;
 let keepaliveTimer = null;
-let currentStatus = { status: 'disconnected', message: '请从本地控制台获取配对码后连接。' };
+let currentStatus = { status: 'disconnected', message: '在当前 Chrome 打开本地控制台，点击连接浏览器。' };
 let accountLabel = null;
+let accountId = null;
+let acknowledged = false;
+let operationQueue = Promise.resolve();
+let detachQueue = Promise.resolve();
+const connectionWaiters = new Set();
 
 function officialPage(url, blank = false) {
   if (blank && url === 'about:blank') return true;
@@ -33,9 +38,33 @@ function officialResponse(url) {
       !/(?:^|\/)[^/]*(?:auth|oauth|login|logout|token|refresh|cookie|sign[-_]?in)[^/]*(?:\/|$)/i.test(value.pathname);
   } catch { return false; }
 }
-function pairingCode(value) { return typeof value === 'string' && /^[A-Za-z0-9_-]{24,128}$/.test(value); }
-function status() { return { ...currentStatus, accountLabel, enabled, ownedTabs: ownedTabs.size, attachedTabs: tabSessions.size, checkedAt: new Date().toISOString() }; }
+function pairingCode(value) { return typeof value === 'string' && /^(?:\d{8}|[A-Za-z0-9_-]{24,128})$/.test(value); }
+function status() { return { ...currentStatus, accountLabel, accountId, enabled, ownedTabs: ownedTabs.size, attachedTabs: tabSessions.size, checkedAt: new Date().toISOString() }; }
 function setStatus(value, message) { currentStatus = { status: value, message }; }
+function connectionError(message, code = 'CONNECTION_FAILED') { return Object.assign(new Error(message), { code }); }
+function settleConnection(error) { for (const waiter of [...connectionWaiters]) waiter(error); }
+function waitForConnection() {
+  if (socket?.readyState === WebSocket.OPEN && acknowledged) return Promise.resolve(status());
+  return new Promise((resolve, reject) => {
+    const finish = error => { clearTimeout(timer); connectionWaiters.delete(finish); error ? reject(error) : resolve(status()); };
+    const timer = setTimeout(() => finish(connectionError('连接尚未完成，请确认本地系统正在运行后重试。', 'CONNECTION_TIMEOUT')), 6000);
+    connectionWaiters.add(finish);
+  });
+}
+function serializeOperation(operation) {
+  const next = operationQueue.then(operation, operation);
+  operationQueue = next.catch(() => {});
+  return next;
+}
+function localConsole(url) {
+  try { const value = new URL(url); return value.protocol === 'http:' && !value.username && !value.password && ['127.0.0.1', 'localhost'].includes(value.hostname) && ['4174', '4173'].includes(value.port); }
+  catch { return false; }
+}
+function senderKind(sender) {
+  if (sender.id !== chrome.runtime.id) return null;
+  if (sender.tab) return Number.isInteger(sender.tab.id) && sender.frameId === 0 && localConsole(sender.url) && localConsole(sender.tab.url) && new URL(sender.url).origin === new URL(sender.tab.url).origin ? 'console' : null;
+  return sender.url === `chrome-extension://${chrome.runtime.id}/popup.html` ? 'popup' : null;
+}
 function send(value, transport = socket) {
   if (transport && transport === socket && transport.readyState === WebSocket.OPEN) transport.send(JSON.stringify(value));
 }
@@ -80,8 +109,14 @@ async function detachTab(tabId) {
   event('Target.detachedFromTarget', { sessionId, targetId: `tab-${tabId}` });
 }
 async function detachAll() {
-  for (const tabId of [...tabSessions.keys()]) await detachTab(tabId);
-  sessions.clear(); tabSessions.clear(); responses.clear();
+  // Socket close and an explicit reconnect may overlap while Chrome is still
+  // detaching a tab. Finish that cleanup before a new transport can attach it.
+  const cleanup = detachQueue.then(async () => {
+    for (const tabId of [...tabSessions.keys()]) await detachTab(tabId);
+    sessions.clear(); tabSessions.clear(); responses.clear();
+  });
+  detachQueue = cleanup.catch(() => {});
+  return cleanup;
 }
 async function attachTab(tab) {
   await ownedTab(tab.id);
@@ -204,7 +239,8 @@ async function dispatch(command) {
 }
 function clearTimers() { if (keepaliveTimer) clearInterval(keepaliveTimer); if (reconnectTimer) clearTimeout(reconnectTimer); keepaliveTimer = null; reconnectTimer = null; }
 async function stopConnection(message = '已断开，保留所有 Chrome 标签页。', persist = true) {
-  enabled = false; generation++; clearTimers(); accountLabel = null;
+  enabled = false; generation++; clearTimers(); acknowledged = false;
+  settleConnection(connectionError(message, 'CONNECTION_CLOSED'));
   if (persist) await chrome.storage.local.set({ connectionEnabled: false });
   const previous = socket; socket = null; previous?.close();
   await detachAll(); autoAttach = false; discover = false;
@@ -216,17 +252,24 @@ function scheduleReconnect() {
 }
 async function connectSocket() {
   if (!enabled || socket) return;
+  const preparingEpoch = generation;
+  await detachQueue;
+  if (!enabled || socket || preparingEpoch !== generation) return;
   const saved = await chrome.storage.local.get('pairingCode');
+  // A user may disconnect or start a different binding during this storage
+  // read. Its old result must never create or replace the new transport.
+  if (!enabled || socket || preparingEpoch !== generation) return;
   if (!pairingCode(saved.pairingCode)) { enabled = false; setStatus('error', '配对码格式无效，请重新粘贴本地控制台提供的配对码。'); return; }
   // The endpoint is a constant; pairing never accepts a remote server URL.
   const transport = new WebSocket(SOCKET_URL, ['catchable', `pair.${saved.pairingCode}`]);
   socket = transport;
   const epoch = ++generation;
+  acknowledged = false;
   const activeCommands = new Set();
   setStatus('connecting', '正在连接本机 Catchable…');
   transport.onopen = () => {
     if (socket !== transport || epoch !== generation) return;
-    retryCount = 0; setStatus('connected', '已连接本机。登录状态请在控制台核验。');
+    retryCount = 0; setStatus('connecting', '正在确认账号连接…');
     send({ type: 'hello', userAgent: navigator.userAgent, protocolVersion: '1.3' }, transport);
     keepaliveTimer = setInterval(() => send({ type: 'ping' }, transport), 20000);
   };
@@ -235,6 +278,12 @@ async function connectSocket() {
     let command; try { command = JSON.parse(message.data); } catch { return; }
     if (command?.type === 'hello_ack') {
       accountLabel = typeof command.accountLabel === 'string' && command.accountLabel.trim() ? command.accountLabel.trim().slice(0,100) : null;
+      accountId = typeof command.accountId === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(command.accountId) ? command.accountId : null;
+      acknowledged = true;
+      setStatus('connected', '已连接，后续会自动重连。');
+      await chrome.storage.local.set({ boundAccountId: accountId, boundAccountLabel: accountLabel });
+      if (socket !== transport || epoch !== generation) return;
+      settleConnection();
       return;
     }
     if (command.type !== 'command' || !Number.isSafeInteger(command.id) || command.id < 0 || activeCommands.has(command.id)) return;
@@ -248,15 +297,23 @@ async function connectSocket() {
   };
   transport.onclose = async (closed) => {
     if (socket !== transport) return;
-    socket = null; generation++; accountLabel = null; if (keepaliveTimer) clearInterval(keepaliveTimer); keepaliveTimer = null;
-    await detachAll(); autoAttach = false; discover = false;
-    if (closed.code === 1008) { enabled = false; await chrome.storage.local.set({ connectionEnabled: false }); setStatus('error', '配对被拒绝，请从本地控制台重新获取配对码。'); return; }
+    socket = null; const closedEpoch = ++generation; acknowledged = false; if (keepaliveTimer) clearInterval(keepaliveTimer); keepaliveTimer = null;
+    settleConnection(connectionError(closed.code === 1008 ? '配对码无效，请重新获取。' : '本机连接已断开，请重试。', closed.code === 1008 ? 'PAIRING_REJECTED' : 'CONNECTION_CLOSED'));
+    const cleanup = detachAll();
+    if (closed.code === 1008) { enabled = false; await chrome.storage.local.set({ connectionEnabled: false }); }
+    await cleanup;
+    if (generation !== closedEpoch || socket) return;
+    autoAttach = false; discover = false;
+    if (closed.code === 1008) { setStatus('error', '配对被拒绝，请从本地控制台重新获取配对码。'); return; }
     setStatus('disconnected', enabled ? '本机连接中断，等待重新连接；不会重放预约操作。' : '已断开。');
     scheduleReconnect();
   };
   transport.onerror = () => { if (socket === transport) setStatus('error', '连接本机失败。请确认 Catchable 正在运行。'); };
 }
 chrome.debugger.onEvent.addListener((source, method, params = {}) => {
+  // Playwright does not consume chunk-progress events. Keep request, response
+  // and completion events intact without serializing every downloaded chunk.
+  if (method === 'Network.dataReceived') return;
   const rootSession = tabSessions.get(source.tabId);
   if (!rootSession) return;
   const sessionId = source.sessionId ? [...sessions].find(([, value]) => value.tabId === source.tabId && value.nativeId === source.sessionId)?.[0] : rootSession;
@@ -302,6 +359,9 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   if (!sessionId) return;
   event('Inspector.detached', { reason }, sessionId);
   event('Target.detachedFromTarget', { sessionId, targetId: `tab-${source.tabId}` }); forgetSession(sessionId);
+  // Closing an individual helper tab is not a request to stop this profile.
+  // tabs.onRemoved will forget the target; the other owned pages stay attached.
+  if (reason === 'target_closed') return;
   void stopConnection('Chrome 已停止调试控制。请确认原因后手动重新连接。');
 });
 chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
@@ -324,25 +384,46 @@ chrome.tabs.onCreated.addListener((tab) => {
   void (async () => { await persistOwned(); if (discover) event('Target.targetCreated', { targetInfo: targetInfo(tab) }); if (autoAttach) await attachTab(tab); })().catch(() => {});
 });
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
-  if (sender.id !== chrome.runtime.id) return false;
+  const kind = senderKind(sender);
+  if (!kind || !message || !['status', 'connect', ...(kind === 'popup' ? ['open_console', 'disconnect'] : [])].includes(message.type)) return false;
   void (async () => {
     await ready;
     if (message?.type === 'status') return status();
     if (message?.type === 'open_console') { await chrome.tabs.create({ url: CONSOLE_URL, active: true }); return status(); }
-    if (message?.type === 'disconnect') { await stopConnection(); return status(); }
-    if (message?.type === 'connect') {
+    return serializeOperation(async () => {
+      if (message.type === 'disconnect') { await stopConnection(); return status(); }
       const saved = await chrome.storage.local.get('pairingCode');
-      const code = message.pairingCode?.trim() || saved.pairingCode;
+      let code = typeof message.pairingCode === 'string' ? message.pairingCode.trim() : saved.pairingCode;
       if (!pairingCode(code)) throw new Error('请粘贴有效的本地配对码。');
+      const expectedId = typeof message.accountId === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(message.accountId) ? message.accountId : null;
+      const sameAccount = expectedId && accountId && expectedId === accountId;
+      const differentBinding = saved.pairingCode && (code !== saved.pairingCode && !sameAccount || expectedId && accountId && expectedId !== accountId);
+      if (differentBinding && message.force !== true) {
+        throw connectionError(`此 Chrome 已绑定${accountLabel ? `「${accountLabel}」` : '其他账号'}。请使用该账号的 Chrome，或确认更换绑定。`, 'ACCOUNT_CONFLICT');
+      }
+      if (sameAccount && saved.pairingCode && message.force !== true) code = saved.pairingCode;
+      if (code === saved.pairingCode && socket && enabled) {
+        if (kind === 'console' || message.awaitAcknowledgement === true) await waitForConnection();
+        if (expectedId && expectedId !== accountId) throw connectionError('扩展返回的账号与所选账号不同，请重新连接。', 'ACCOUNT_MISMATCH');
+        return status();
+      }
       await stopConnection('正在重新连接…', false);
       // Switching accounts must not adopt the preceding account's pages.
       // Leave those tabs open, detach them, and create fresh owned tabs.
-      if (saved.pairingCode !== code) { ownedTabs.clear(); await persistOwned(); }
+      if (saved.pairingCode !== code) {
+        ownedTabs.clear(); accountId = null; accountLabel = null; await persistOwned();
+        await chrome.storage.local.set({ boundAccountId: null, boundAccountLabel: null });
+      }
       await chrome.storage.local.set({ pairingCode: code, connectionEnabled: true });
-      enabled = true; await connectSocket(); return status();
-    }
-    throw new Error('未知扩展操作。');
-  })().then(value => respond({ ok: true, ...value }), error => respond({ ok: false, message: error.message || '操作失败。' }));
+      enabled = true; await connectSocket();
+      if (kind === 'console' || message.awaitAcknowledgement === true) await waitForConnection();
+      if (expectedId && expectedId !== accountId) {
+        await stopConnection('账号不匹配，已停止连接。');
+        throw connectionError('配对账号与所选账号不同，请重新连接。', 'ACCOUNT_MISMATCH');
+      }
+      return status();
+    });
+  })().then(value => respond({ ok: true, ...value }), error => respond({ ok: false, ...status(), code: error.code || 'OPERATION_FAILED', message: error.message || '操作失败。' }));
   return true;
 });
 const ready = (async () => {
@@ -351,7 +432,9 @@ const ready = (async () => {
     if (!Number.isInteger(tabId)) continue;
     try { const tab = await chrome.tabs.get(tabId); if (officialPage(tab.url || 'about:blank', true)) ownedTabs.add(tabId); } catch { /* Closed fixture or previous owned tabs. */ }
   }
-  const saved = await chrome.storage.local.get('connectionEnabled');
+  const saved = await chrome.storage.local.get({ connectionEnabled: false, boundAccountId: null, boundAccountLabel: null });
+  accountId = typeof saved.boundAccountId === 'string' ? saved.boundAccountId : null;
+  accountLabel = typeof saved.boundAccountLabel === 'string' ? saved.boundAccountLabel : null;
   enabled = saved.connectionEnabled === true;
   if (enabled) await connectSocket();
 })();

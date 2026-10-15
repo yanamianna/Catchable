@@ -1,12 +1,18 @@
 {
   "manifest_version": 3,
   "name": "Catchable 本地订座助手",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "将本地 Catchable 连接到您当前 Chrome 中由助手新建的 Catchtable 标签页。",
   "minimum_chrome_version": "125",
   "permissions": ["debugger", "tabs", "storage"],
   "host_permissions": ["https://www.catchtable.net/*", "https://catchtable.net/*", "http://127.0.0.1:4174/*"],
   "background": { "service_worker": "service-worker.js" },
+  "content_scripts": [{
+    "matches": ["http://127.0.0.1:4174/*", "http://localhost:4174/*", "http://127.0.0.1:4173/*", "http://localhost:4173/*"],
+    "js": ["console-bridge.js"],
+    "all_frames": false,
+    "run_at": "document_start"
+  }],
   "action": { "default_popup": "popup.html", "default_title": "Catchable 本地订座助手" },
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:4174"

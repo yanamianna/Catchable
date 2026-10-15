@@ -13,6 +13,7 @@ export class Engine {
     this.sessionTimer = null;
     this.sessionRefreshPending = false;
     this.deliveryPromise = null;
+    this.resourceCleanups = new Set();
     this.tail = Promise.resolve();
     this.pending = 0;
     this.tickPending = false;
@@ -78,7 +79,15 @@ export class Engine {
     this.sessionTimer = null;
     await this.tail;
     await this.deliveryPromise;
+    await Promise.allSettled([...this.resourceCleanups]);
     await this.adapter.close?.();
+  }
+  releaseTaskResources(id, adapter = this.adapter) {
+    if (typeof adapter.releaseTask !== 'function') return;
+    const cleanup = Promise.resolve().then(() => adapter.releaseTask(id)).catch(error => {
+      this.store.addEvent({ type: 'resource_cleanup_failed', taskId: id, level: 'warning', message: safeMessage(error, '任务页面清理未完成。'), createdAt: this.timestamp() });
+    }).finally(() => this.resourceCleanups.delete(cleanup));
+    this.resourceCleanups.add(cleanup);
   }
   schedule() {
     if (this.timer) clearTimeout(this.timer);
@@ -86,14 +95,17 @@ export class Engine {
     this.nextWakeAt = null;
     if (!this.schedulerActive || this.stopped || this.pending > 0 || this.tickPending) return;
     const paused = this.store.settings().enginePaused;
-    const pendingTaskIds=new Set(this.store.listPendingAttempts().map(attempt=>attempt.taskId));
+    const pendingAttempts=this.store.listPendingAttempts();
+    const pendingTaskIds=new Set(pendingAttempts.map(attempt=>attempt.taskId));
+    const tasks=this.store.listTasks();
+    const tasksById=new Map(tasks.map(task=>[task.id,task]));
     let earliest = Infinity;
-    for (const task of this.store.listTasks()) {
+    for (const task of tasks) {
       if (!TERMINAL_TASK_STATUSES.has(task.status) && !pendingTaskIds.has(task.id)) earliest = Math.min(earliest, Date.parse(task.deadline));
       if (!paused && !pendingTaskIds.has(task.id) && task.source === 'live' && ACTIVE_TASK_STATUSES.has(task.status) && task.nextCheckAt) earliest = Math.min(earliest, Date.parse(task.nextCheckAt));
     }
-    if(!paused)for(const attempt of this.store.listPendingAttempts()) {
-      if(this.verificationEnabled(attempt) && attempt.nextVerificationAt)earliest=Math.min(earliest,Date.parse(attempt.nextVerificationAt));
+    if(!paused)for(const attempt of pendingAttempts) {
+      if(this.verificationEnabled(attempt,tasksById.get(attempt.taskId)) && attempt.nextVerificationAt)earliest=Math.min(earliest,Date.parse(attempt.nextVerificationAt));
     }
     if (!Number.isFinite(earliest)) return;
     const delay = Math.max(1, Math.min(2147483647, earliest - this.now()));
@@ -128,18 +140,24 @@ export class Engine {
     try {
       await this.enqueue(async () => {
         this.lastTickAt = this.timestamp();
-        const pendingTaskIds=new Set(this.store.listPendingAttempts().map(attempt=>attempt.taskId));
-        for (const task of this.store.listTasks()) {
+        const pendingAttempts=this.store.listPendingAttempts();
+        const pendingTaskIds=new Set(pendingAttempts.map(attempt=>attempt.taskId));
+        const tasks=this.store.listTasks();
+        const tasksById=new Map(tasks.map(task=>[task.id,task]));
+        const expiredIds=new Set();
+        for (const task of tasks) {
           if (!TERMINAL_TASK_STATUSES.has(task.status) && !pendingTaskIds.has(task.id) && Date.parse(task.deadline) <= this.now()) {
             this.store.patchTask(task.id, { status: 'expired', nextCheckAt: null, lastMessage: '已到截止时间，任务自动结束。' }, this.timestamp());
             this.event(task, 'expired', '已到截止时间，任务自动结束。');
+            expiredIds.add(task.id);
+            this.releaseTaskResources(task.id);
           }
         }
         if (!this.store.settings().enginePaused) {
-          const verification=this.store.listPendingAttempts().filter(attempt=>this.verificationEnabled(attempt) && attempt.nextVerificationAt && Date.parse(attempt.nextVerificationAt)<=this.now())
+          const verification=pendingAttempts.filter(attempt=>this.verificationEnabled(attempt,tasksById.get(attempt.taskId)) && attempt.nextVerificationAt && Date.parse(attempt.nextVerificationAt)<=this.now())
             .sort((a,b)=>a.nextVerificationAt.localeCompare(b.nextVerificationAt))[0];
           if(verification) {await this.verifyAttempt(verification);return;}
-          const due = this.store.listTasks().filter((task) => ACTIVE_TASK_STATUSES.has(task.status)
+          const due = tasks.filter((task) => !expiredIds.has(task.id) && ACTIVE_TASK_STATUSES.has(task.status)
             && !pendingTaskIds.has(task.id) && task.source === 'live' && task.nextCheckAt && Date.parse(task.nextCheckAt) <= this.now())
             .sort((a, b) => a.nextCheckAt.localeCompare(b.nextCheckAt));
           if (due[0]) await this.checkTask(due[0].id);
@@ -208,6 +226,7 @@ export class Engine {
     if (Date.parse(task.deadline) <= this.now()) {
       this.store.patchTask(id, { ...metrics, status: 'expired', nextCheckAt: null, lastMessage: '检查期间已到截止时间，没有继续提交。', lastCheckedAt: timestamp, checkCount: task.checkCount + 1 }, timestamp);
       this.event(task, 'expired', '检查期间已到截止时间，没有继续提交。');
+      this.releaseTaskResources(id, adapter);
       return;
     }
     const stillRunning = ACTIVE_TASK_STATUSES.has(task.status);
@@ -238,10 +257,17 @@ export class Engine {
     const message = observation.message || (slots.length ? `发现 ${slots.length} 个匹配空位。` : '暂时没有匹配空位。');
     this.store.transaction(() => {
       const fresh = this.store.recordSlots(task.id, slots, { observedDates });
+      const observationStatus=slots.length ? 'available' : 'unavailable';
+      // Persist every observation in task metrics, but avoid an unbounded
+      // identical log row for each millisecond inventory check.
+      const logCheck=manual || fresh.length>0 || task.lastObservationStatus!==observationStatus
+        || task.lastObservationComplete!==(observation.complete!==false) || task.lastMessage!==message
+        || JSON.stringify(displayedSlots)!==JSON.stringify(task.slots || [])
+        || !task.lastCheckEventAt || this.now()-Date.parse(task.lastCheckEventAt)>=30000;
       this.store.patchTask(id, { ...metrics, slots: displayedSlots, lastCheckedAt: timestamp, lastSuccessfulAt: timestamp, lastObservationStatus: slots.length ? 'available' : 'unavailable', lastObservationComplete: observation.complete !== false,
         status: preservePaused ? 'paused' : 'active', nextCheckAt: preservePaused ? null : new Date(this.now() + task.pollIntervalMs).toISOString(),
-        failureCount: 0, checkCount: count, lastMessage: message }, timestamp);
-      this.event(task, 'checked', message);
+        failureCount: 0, checkCount: count, lastMessage: message, ...(logCheck?{lastCheckEventAt:timestamp}:{}) }, timestamp);
+      if(logCheck)this.event(task, 'checked', message);
       for (const { slot, eventKey } of fresh) this.notify(task, 'slot_available', `${task.source === 'demo' ? '【演练】' : ''}${task.restaurantName} 出现匹配空位：${slot.date} ${slot.time}（韩国时间），${slot.partySize} 人。`, { slot, eventKey });
     });
     if (!slots.length || (!stillRunning && !manual) || preservePaused || this.stopped || this.store.settings().enginePaused) return;
@@ -278,10 +304,10 @@ export class Engine {
     catch (error) { result = { status: 'outcome_unknown', message: safeMessage(error, '提交结果不明，请核验已有预约。') }; }
     finally {this.currentTaskId=null;}
     if(result?.phase==='authentication' && this.adapter.lastSession)this.applySession(this.adapter.lastSession);
-    this.finishAttempt(this.store.getAttempt(attempt.id) || attempt, result);
+    this.finishAttempt(this.store.getAttempt(attempt.id) || attempt, result, { adapter });
   }
 
-  finishAttempt(attempt, result, { verification = false, verificationFailed = false } = {}) {
+  finishAttempt(attempt, result, { verification = false, verificationFailed = false, adapter = this.adapter } = {}) {
     const allowed = ['confirmed', 'rejected', 'outcome_unknown', 'user_action_required', 'pending_restaurant'];
     let status = allowed.includes(result?.status) ? result.status : 'outcome_unknown';
     // Pending requests and confirmations both need an identified, matching official order.
@@ -309,11 +335,13 @@ export class Engine {
       verificationCount:count,verificationFailureCount:failures,
       lastVerifiedAt:verification?timestamp:attempt.lastVerifiedAt || null,lastVerificationMessage:verification?readMessage:attempt.lastVerificationMessage || null,
       nextVerificationAt:VERIFIABLE_ATTEMPT_STATUSES.has(status) && this.autoVerificationAuthorised(attempt)?new Date(this.now()+delay).toISOString():null,updatedAt:timestamp};
+    let nextTaskStatus;
     this.store.transaction(() => {
       this.store.saveAttempt(updated);
       if (task) {
         const nextStatus=status==='confirmed'?'confirmed':status==='rejected'?(Date.parse(task.deadline)<=this.now()?'expired':task.status==='paused' || verification || updated.submitted?'paused':'active')
           :task.status==='paused'?'paused':status==='pending_restaurant'?'awaiting_confirmation':'user_action_required';
+        nextTaskStatus=nextStatus;
         this.store.patchTask(task.id, { status: nextStatus, nextCheckAt: nextStatus === 'active' ? new Date(this.now() + task.pollIntervalMs).toISOString() : null,
           nextVerificationAt:updated.nextVerificationAt,verificationCount:count,lastVerifiedAt:updated.lastVerifiedAt,lastMessage: message }, timestamp);
         if(status!==attempt.status)this.notify(task, `booking_${status}`, message, { bookingId: attempt.id, slot: attempt.slot,phase:updated.phase });
@@ -327,6 +355,7 @@ export class Engine {
         }
       }
     });
+    if(task && (status==='confirmed' || (status==='rejected' && nextTaskStatus!=='active')))this.releaseTaskResources(task.id,adapter);
     return status;
   }
 
@@ -342,8 +371,7 @@ export class Engine {
     const task=attempt.taskSnapshot || this.store.getTask(attempt.taskId);
     return attempt.source==='live' && task?.mode==='auto' && task.autoConsent===true;
   }
-  verificationEnabled(attempt) {
-    const task=this.store.getTask(attempt.taskId);
+  verificationEnabled(attempt, task=this.store.getTask(attempt.taskId)) {
     return this.adapter.hasContext!==false && Boolean(task) && VERIFIABLE_ATTEMPT_STATUSES.has(attempt.status) && this.autoVerificationAuthorised(attempt) && task.status!=='paused';
   }
   initialiseVerifications() {
@@ -363,7 +391,7 @@ export class Engine {
     try { result = await adapter.reconcile({ ...attempt, task: attempt.taskSnapshot || task }); }
     catch (error) {failed=true;result = { status: 'outcome_unknown', message: safeMessage(error, '暂时无法核验预约。') }; }
     finally {this.currentTaskId=null;}
-    this.finishAttempt(attempt,result,{verification:true,verificationFailed:failed});
+    this.finishAttempt(attempt,result,{verification:true,verificationFailed:failed,adapter});
     if(!failed && this.automaticContinuationAllowed(attempt,result,adapter)) {
       await this.continueAutoTask(this.task(attempt.taskId),adapter,{automatic:true,attemptId:attempt.id});
     }
@@ -441,7 +469,7 @@ export class Engine {
     }
     finally {this.currentTaskId=null;}
     if(result?.phase==='authentication' && adapter.lastSession)this.applySession(adapter.lastSession);
-    this.finishAttempt(this.store.getAttempt(attempt.id) || attempt,result,{verification:attempt.status==='pending_restaurant'});
+    this.finishAttempt(this.store.getAttempt(attempt.id) || attempt,result,{verification:attempt.status==='pending_restaurant',adapter});
     return {task:this.task(task.id)};
   }
 
@@ -472,6 +500,7 @@ export class Engine {
       this.store.patchTask(task.id, { status: Date.parse(task.deadline) <= this.now() ? 'expired' : 'paused', nextCheckAt: null,nextVerificationAt:null, resumeAfterAuth: false, lastMessage: '已按用户确认清除待核验状态。任务已暂停，点击启动恢复监控。' }, timestamp);
       this.notify(task, 'booking_abandoned', message, { bookingId: attempt.id, resolutionOrigin: 'user', slot: attempt.slot });
     });
+    this.releaseTaskResources(task.id);
     return { task: this.task(task.id), message };
   }
 
@@ -587,6 +616,7 @@ export class Engine {
     if (this.currentTaskId === id || this.store.attemptsForTask(id).some((attempt) => PENDING_ATTEMPT_STATUSES.has(attempt.status))) throw new HttpError(409, '任务正在运行或有待核验的预约，请先处理待办后再删除。');
     this.store.deleteTask(id);
     this.event(task, 'deleted', '任务已删除，历史预约和运行记录保留。');
+    this.releaseTaskResources(id);
     this.schedule();
   }
 

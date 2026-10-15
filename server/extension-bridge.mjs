@@ -1,9 +1,10 @@
-import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 
-const PAIRING_PATTERN = /^[A-Za-z0-9_-]{24,128}$/;
+const SIMPLE_PAIRING_PATTERN = /^\d{8}$/;
+const PAIRING_PATTERN = /^(?:\d{8}|[A-Za-z0-9_-]{24,128})$/;
 const ACCOUNT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/;
 const ROOT_TARGET_METHODS = new Set(['Target.getTargets','Target.getTargetInfo','Target.getBrowserContexts','Target.setDiscoverTargets','Target.setAutoAttach','Target.attachToTarget','Target.detachFromTarget','Target.createTarget','Target.closeTarget','Target.activateTarget']);
 const PAGE_DOMAINS = new Set(['Page','Runtime','DOM','CSS','Network','Log','Inspector','Emulation','Input','Accessibility','Target']);
@@ -66,6 +67,8 @@ export function redactExtensionPayload(value) {
 
 export class ExtensionBridge {
   #pairingCode;
+  #simplePairingCode;
+  #accountId;
   #cdpToken = randomBytes(32).toString('base64url');
   #extension = null;
   #hello = null;
@@ -73,6 +76,7 @@ export class ExtensionBridge {
   #nextId = 1;
   #targets = new Map();
   #sessions = new Map();
+  #sessionParents = new Map();
   #responses = new Map();
   #mainFrames = new Map();
   #cdpClients = new Set();
@@ -85,11 +89,13 @@ export class ExtensionBridge {
   #lastIssue = null;
   #label = null;
 
-  constructor({ dataDir = resolve('.local-data'), extensionPath = resolve('extension'), port = 4174, pairingCode, commandTimeoutMs = 15000, handshakeTimeoutMs = 5000 } = {}) {
+  constructor({ dataDir = resolve('.local-data'), extensionPath = resolve('extension'), port = 4174, pairingCode, accountId = 'default', commandTimeoutMs = 15000, handshakeTimeoutMs = 5000 } = {}) {
     this.dataDir = resolve(dataDir); this.extensionPath = resolve(extensionPath); this.port = port;
     this.commandTimeoutMs = commandTimeoutMs; this.handshakeTimeoutMs = handshakeTimeoutMs;
-    if (pairingCode !== undefined && !PAIRING_PATTERN.test(pairingCode)) throw new Error('扩展配对码格式不正确。');
+    if (pairingCode !== undefined && (typeof pairingCode !== 'string' || !PAIRING_PATTERN.test(pairingCode))) throw new Error('扩展配对码格式不正确。');
+    if (typeof accountId !== 'string' || !ACCOUNT_PATTERN.test(accountId)) throw new Error('账号标识格式不正确。');
     this.#pairingCode = pairingCode;
+    this.#accountId = accountId;
   }
 
   async init() {
@@ -130,14 +136,31 @@ export class ExtensionBridge {
     return { pairingCode: this.#pairingCode, extensionPath: this.extensionPath };
   }
 
-  setLabel(label) {
-    if (typeof label !== 'string' || !label.trim() || label.length > 100) throw new Error('账号名称格式不正确。');
-    this.#label = label.trim();
-    if (this.#hello && this.#extension?.readyState === WebSocket.OPEN) this.#extension.send(JSON.stringify({ type: 'hello_ack', accountLabel: this.#label }));
+  setSimplePairingCode(code) {
+    if (typeof code !== 'string' || !SIMPLE_PAIRING_PATTERN.test(code)) throw new Error('简易配对码须为 8 位数字。');
+    if (this.#simplePairingCode && this.#simplePairingCode !== code) throw new Error('不能更换已绑定的简易配对码。');
+    this.#simplePairingCode = code;
     return this;
   }
 
-  matchesPairing(protocol) { return this.#initialized && equalSecret(protocol, `pair.${this.#pairingCode}`); }
+  simplePairingInfo() {
+    if (!this.#initialized || !this.#simplePairingCode) throw new Error('简易配对码尚未初始化。');
+    return { pairingCode: this.#simplePairingCode, extensionPath: this.extensionPath };
+  }
+
+  #acknowledgement() { return { type: 'hello_ack', accountId: this.#accountId, accountLabel: this.#label }; }
+
+  setLabel(label) {
+    if (typeof label !== 'string' || !label.trim() || label.length > 100) throw new Error('账号名称格式不正确。');
+    this.#label = label.trim();
+    if (this.#hello && this.#extension?.readyState === WebSocket.OPEN) this.#extension.send(JSON.stringify(this.#acknowledgement()));
+    return this;
+  }
+
+  matchesPairing(protocol) {
+    return this.#initialized && (equalSecret(protocol, `pair.${this.#pairingCode}`)
+      || Boolean(this.#simplePairingCode && equalSecret(protocol, `pair.${this.#simplePairingCode}`)));
+  }
   matchesCdpPath(path) { return equalSecret(path, `/cdp/${this.#cdpToken}`); }
   handleUpgrade(request, socket, head) {
     if (!this.#upgrade) throw new Error('扩展桥尚未绑定本地服务。');
@@ -174,8 +197,8 @@ export class ExtensionBridge {
         const origin = request.headers.origin || '';
         const protocols = String(request.headers['sec-websocket-protocol'] || '').split(',').map(value => value.trim());
         if (!/^chrome-extension:\/\/[a-p]{32}$/.test(origin)) { issue('origin_invalid'); return reject(); }
-        if (protocols.length !== 2 || protocols[0] !== 'catchable' || !/^pair\.[A-Za-z0-9_-]{24,128}$/.test(protocols[1])) { issue('protocol_invalid'); return reject(); }
-        if (!equalSecret(protocols[1], `pair.${this.#pairingCode}`)) { issue('pairing_mismatch'); return reject(); }
+        if (protocols.length !== 2 || protocols[0] !== 'catchable' || !protocols[1]?.startsWith('pair.') || !PAIRING_PATTERN.test(protocols[1].slice(5))) { issue('protocol_invalid'); return reject(); }
+        if (!this.matchesPairing(protocols[1])) { issue('pairing_mismatch'); return reject(); }
         if (this.#extension && this.#extension.readyState !== WebSocket.CLOSED) { issue('already_connected'); return reject(409); }
         return this.#workerServer.handleUpgrade(request, socket, head, accepted => this.#workerServer.emit('connection', accepted, request));
       }
@@ -215,7 +238,7 @@ export class ExtensionBridge {
           return invalidHello('Invalid extension handshake');
         this.#hello = { userAgent: message.userAgent, protocolVersion: '1.3' };
         this.#lastIssue = null;
-        if (this.#label !== null) socket.send(JSON.stringify({ type: 'hello_ack', accountLabel: this.#label }));
+        socket.send(JSON.stringify(this.#acknowledgement()));
         clearTimeout(timer); return;
       }
       if (message.type === 'result') {
@@ -240,7 +263,7 @@ export class ExtensionBridge {
       if (this.#extension !== socket) return;
       if (!handshakeFailed) this.#issue('worker_disconnected');
       this.#extension = null; this.#hello = null;
-      this.#targets.clear(); this.#sessions.clear(); this.#responses.clear(); this.#mainFrames.clear();
+      this.#targets.clear(); this.#sessions.clear(); this.#sessionParents.clear(); this.#responses.clear(); this.#mainFrames.clear();
       this.#rejectPending(bridgeError('Chrome 扩展已断开；未完成的命令不会自动重发。', 'EXTENSION_DISCONNECTED'));
       for (const client of this.#cdpClients) client.close(1011, 'Extension disconnected');
     });
@@ -270,6 +293,25 @@ export class ExtensionBridge {
     return output;
   }
 
+  #forgetSession(sessionId) {
+    const info = this.#sessions.get(sessionId);
+    if (!info) return;
+    this.#sessions.delete(sessionId); this.#sessionParents.delete(sessionId);
+    for (const [child, parent] of this.#sessionParents) if (parent === sessionId) this.#forgetSession(child);
+    for (const key of this.#responses.keys()) if (key.startsWith(`${sessionId}:`)) this.#responses.delete(key);
+    if (![...this.#sessions.values()].some(session => session.targetId === info.targetId)) {
+      this.#mainFrames.delete(info.targetId);
+      // A detached page can still be an owned Chrome tab. Detached iframe
+      // targets have no independent lifetime and must not accumulate here.
+      if (info.type === 'iframe') this.#targets.delete(info.targetId);
+    }
+  }
+
+  #forgetTarget(targetId) {
+    for (const [sessionId, info] of this.#sessions) if (info.targetId === targetId) this.#forgetSession(sessionId);
+    this.#targets.delete(targetId); this.#mainFrames.delete(targetId);
+  }
+
   #extensionEvent(message) {
     if (typeof message.method !== 'string' || !message.params || typeof message.params !== 'object') return;
     let params = redactExtensionPayload(message.params);
@@ -278,6 +320,7 @@ export class ExtensionBridge {
       const info = this.#targetInfo(params.targetInfo);
       if (!info || typeof params.sessionId !== 'string' || (parent && !this.#sessions.has(parent))) return;
       this.#targets.set(info.targetId, info); this.#sessions.set(params.sessionId, info);
+      if (parent) this.#sessionParents.set(params.sessionId, parent);
       params.targetInfo = info;
     } else if (['Target.targetCreated','Target.targetInfoChanged'].includes(message.method)) {
       const info = this.#targetInfo(params.targetInfo);
@@ -285,10 +328,10 @@ export class ExtensionBridge {
       this.#targets.set(info.targetId, info); params.targetInfo = info;
     } else if (message.method === 'Target.detachedFromTarget') {
       if (!this.#sessions.has(params.sessionId)) return;
-      this.#sessions.delete(params.sessionId);
+      this.#forgetSession(params.sessionId);
     } else if (message.method === 'Target.targetDestroyed') {
       if (!this.#targets.has(params.targetId)) return;
-      this.#targets.delete(params.targetId); this.#mainFrames.delete(params.targetId);
+      this.#forgetTarget(params.targetId);
     } else {
       if (!parent || !this.#sessions.has(parent) || !PAGE_DOMAINS.has(message.method.split('.')[0])) return;
       if (message.method === 'Network.responseReceived' && params.response && typeof params.requestId === 'string' && isAllowedObservedResponse(params.response.url)) {
@@ -296,7 +339,7 @@ export class ExtensionBridge {
         if (this.#responses.size > 2000) this.#responses.delete(this.#responses.keys().next().value);
       }
       if (message.method === 'Page.frameNavigated' && !params.frame?.parentId && !isAllowedExtensionTarget(params.frame?.url)) {
-        this.#sessions.delete(parent); return;
+        this.#forgetSession(parent); return;
       }
       if (message.method === 'Page.frameNavigated' && !params.frame?.parentId) {
         const info = this.#sessions.get(parent);
@@ -365,7 +408,7 @@ export class ExtensionBridge {
       return { targetInfo: info };
     }
     if (method === 'Target.closeTarget' && result.success) {
-      this.#targets.delete(params.targetId); this.#mainFrames.delete(params.targetId);
+      this.#forgetTarget(params.targetId);
     }
     return result;
   }
@@ -399,7 +442,7 @@ export class ExtensionBridge {
     for (const client of this.#cdpClients) client.terminate();
     this.#extension?.terminate();
     this.#cdpClients.clear(); this.#extension = null; this.#hello = null;
-    this.#targets.clear(); this.#sessions.clear(); this.#responses.clear(); this.#mainFrames.clear();
+    this.#targets.clear(); this.#sessions.clear(); this.#sessionParents.clear(); this.#responses.clear(); this.#mainFrames.clear();
     await Promise.all([this.#workerServer, this.#cdpServer].filter(Boolean).map(server => new Promise(done => server.close(() => done()))));
   }
 }
@@ -412,6 +455,8 @@ export class ExtensionBroker {
   #server = null;
   #upgrade = null;
   #closed = false;
+  #registration = Promise.resolve();
+  #simpleCodeOwners = null;
 
   constructor({ dataDir = resolve('.local-data'), port = 4174, extensionPath = resolve('extension'), ...options } = {}) {
     this.dataDir = resolve(dataDir); this.port = port; this.extensionPath = resolve(extensionPath); this.options = options;
@@ -419,20 +464,77 @@ export class ExtensionBroker {
 
   async init() { await this.ensureAccount('default'); return this; }
 
+  async #readSimpleCode(dataDir) {
+    try { return (await readFile(join(dataDir, 'extension-pairing.code'), 'utf8')).trim(); }
+    catch (error) {
+      if (error.code === 'ENOENT') return null;
+      throw new Error('无法读取本地简易配对设置。');
+    }
+  }
+
+  async #loadSimpleCodeOwners() {
+    if (this.#simpleCodeOwners) return;
+    const entries = [['default', this.dataDir]];
+    try {
+      const accountsDir = join(this.dataDir, 'accounts');
+      for (const entry of await readdir(accountsDir, { withFileTypes: true })) {
+        if (entry.isDirectory() && ACCOUNT_PATTERN.test(entry.name)) entries.push([entry.name, join(accountsDir, entry.name)]);
+      }
+    } catch (error) { if (error.code !== 'ENOENT') throw new Error('无法读取本地账号配对设置。'); }
+    const owners = new Map();
+    for (const [id, directory] of entries) {
+      const code = await this.#readSimpleCode(directory);
+      if (!code || !SIMPLE_PAIRING_PATTERN.test(code)) continue;
+      if (!owners.has(code)) owners.set(code, new Set());
+      owners.get(code).add(id);
+    }
+    this.#simpleCodeOwners = owners;
+  }
+
+  async #registerBridge(accountId, bridge) {
+    // Registration is brief and serial; execution and browser commands remain
+    // independent. Reserve persisted codes before generating any new aliases.
+    const operation = this.#registration.then(async () => {
+      if (this.#closed) throw new Error('本地扩展服务已停止。');
+      await this.#loadSimpleCodeOwners();
+      if ([...this.#bridges.values()].some(existing => existing.matchesPairing(`pair.${bridge.pairingInfo().pairingCode}`)))
+        throw new Error('账号扩展配对设置重复，暂未启用此账号连接。');
+      let code = await this.#readSimpleCode(bridge.dataDir);
+      if (code === null) {
+        do { code = String(randomInt(100000000)).padStart(8, '0'); }
+        while (this.#simpleCodeOwners.has(code) || [...this.#bridges.values()].some(existing => existing.matchesPairing(`pair.${code}`)));
+        await mkdir(bridge.dataDir, { recursive: true });
+        try { await writeFile(join(bridge.dataDir, 'extension-pairing.code'), `${code}\n`, { flag: 'wx', mode: 0o600 }); }
+        catch (error) {
+          if (error.code !== 'EEXIST') throw new Error('无法保存本地简易配对设置。');
+          code = await this.#readSimpleCode(bridge.dataDir);
+        }
+      }
+      if (typeof code !== 'string' || !SIMPLE_PAIRING_PATTERN.test(code)) throw new Error('本地简易配对设置已损坏。');
+      const owners = this.#simpleCodeOwners.get(code);
+      if ((owners && [...owners].some(id => id !== accountId)) || [...this.#bridges.values()].some(existing => existing.matchesPairing(`pair.${code}`)))
+        throw new Error('账号简易配对设置重复，暂未启用此账号连接。');
+      if (this.#closed) throw new Error('本地扩展服务已停止。');
+      this.#simpleCodeOwners.set(code, new Set([accountId]));
+      bridge.setSimplePairingCode(code).setLabel(accountId === 'default' ? '默认账号' : accountId);
+      if (this.#server) bridge.attach(this.#server, { listen: false });
+      this.#bridges.set(accountId, bridge);
+      return bridge;
+    });
+    this.#registration = operation.catch(() => {});
+    return operation;
+  }
+
   async ensureAccount(accountId = 'default') {
     if (this.#closed) throw new Error('本地扩展服务已停止。');
     if (typeof accountId !== 'string' || !ACCOUNT_PATTERN.test(accountId)) throw new Error('账号标识格式不正确。');
     if (this.#bridges.has(accountId)) return this.#bridges.get(accountId);
     if (this.#creating.has(accountId)) return this.#creating.get(accountId);
     const promise = (async () => {
-      const bridge = new ExtensionBridge({ ...this.options, dataDir: accountId === 'default' ? this.dataDir : join(this.dataDir, 'accounts', accountId), port: this.port, extensionPath: this.extensionPath });
+      const bridge = new ExtensionBridge({ ...this.options, accountId, dataDir: accountId === 'default' ? this.dataDir : join(this.dataDir, 'accounts', accountId), port: this.port, extensionPath: this.extensionPath });
       await bridge.init();
-      if (this.#closed) { await bridge.close(); throw new Error('本地扩展服务已停止。'); }
-      if([...this.#bridges.values()].some(existing=>existing.matchesPairing(`pair.${bridge.pairingInfo().pairingCode}`)))throw new Error('账号扩展配对设置重复，暂未启用此账号连接。');
-      bridge.setLabel(accountId === 'default' ? '默认账号' : accountId);
-      if (this.#server) bridge.attach(this.#server, { listen: false });
-      this.#bridges.set(accountId, bridge);
-      return bridge;
+      try { return await this.#registerBridge(accountId, bridge); }
+      catch (error) { await bridge.close(); throw error; }
     })();
     this.#creating.set(accountId, promise);
     try { return await promise; } finally { this.#creating.delete(accountId); }
@@ -446,6 +548,7 @@ export class ExtensionBroker {
 
   state(accountId = 'default') { return this.getBridge(accountId).state(); }
   pairingInfo(accountId = 'default') { return this.getBridge(accountId).pairingInfo(); }
+  simplePairingInfo(accountId = 'default') { return this.getBridge(accountId).simplePairingInfo(); }
 
   attach(server) {
     if (this.#closed || this.#server) throw new Error('本地扩展服务已停止或已绑定。');

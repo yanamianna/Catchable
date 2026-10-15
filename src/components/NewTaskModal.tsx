@@ -6,6 +6,7 @@ import { Modal } from './Modal';
 import { Icon } from './Icon';
 import { IntervalInput, intervalValidation } from './IntervalInput';
 import { RestaurantPreview } from './RestaurantPreview';
+import { accountAuthenticated } from './Accounts';
 
 const modeOptions = [
   { value: 'notify', label: '空位提醒', detail: '发现空位后通知你' },
@@ -58,20 +59,27 @@ export function NewTaskModal({ onClose, onCreate, interval, currentDate, account
   const sequence = useRef(0);
   const currentUrl = useRef('');
   const mounted = useRef(true);
+  const lookup = useRef<AbortController | null>(null);
+  const submitting = useRef(false);
   const preferenceTouched = useRef({ party: false, from: false, to: false });
   const intervalTouched = useRef(false);
-  useEffect(() => { mounted.current = true; return () => { mounted.current = false; sequence.current += 1; }; }, []);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; sequence.current += 1; lookup.current?.abort(); }; }, []);
 
   function changeUrl(value: string) {
     if (value === currentUrl.current) return;
-    currentUrl.current = value; sequence.current += 1;
+    currentUrl.current = value; sequence.current += 1; lookup.current?.abort(); lookup.current = null;
     setUrl(value); setRestaurant(null); setName(''); setManualName(false); setResolving(false); setResolveError(''); setError('');
   }
   function changeAccount(value: string) {
     if (value === selectedAccountId) return;
-    setSelectedAccountId(value); sequence.current += 1;
+    setSelectedAccountId(value); sequence.current += 1; lookup.current?.abort(); lookup.current = null;
     setRestaurant(null); setName(''); setManualName(false); setResolving(false); setResolveError(''); setError('');
     if (!intervalTouched.current) setPoll(String(accounts.find(account => account.id === value)?.settings.pollIntervalMs ?? interval));
+  }
+  function cancelResolve() {
+    sequence.current += 1; lookup.current?.abort(); lookup.current = null;
+    setResolving(false); setResolveError('已停止等待，可重试或手动填写餐厅名。');
+    if (!restaurant) setManualName(true);
   }
   async function resolveRestaurant() {
     setResolveError(''); setError('');
@@ -80,9 +88,11 @@ export function NewTaskModal({ onClose, onCreate, interval, currentDate, account
     catch (cause) { setResolveError(cause instanceof Error ? cause.message : '链接格式不正确。'); return; }
     const requestId = ++sequence.current;
     const inputAtStart = currentUrl.current;
+    lookup.current?.abort();
+    const controller = new AbortController(); lookup.current = controller;
     setResolving(true);
     try {
-      const result = await api<{ restaurant: RestaurantInfo }>('/api/restaurants/resolve', { restaurantUrl: requestedUrl, accountId: selectedAccountId });
+      const result = await api<{ restaurant: RestaurantInfo }>('/api/restaurants/resolve', { restaurantUrl: requestedUrl, accountId: selectedAccountId }, undefined, controller.signal);
       if (!mounted.current || requestId !== sequence.current || currentUrl.current !== inputAtStart) return;
       if (!result.restaurant?.restaurantName?.trim() || result.restaurant.source !== 'catchtable_public') throw new Error('未能确认官方餐厅名称，请重试或手动填写。');
       const info = result.restaurant;
@@ -93,11 +103,16 @@ export function NewTaskModal({ onClose, onCreate, interval, currentDate, account
       if (!preferenceTouched.current.from && defaults && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(defaults.timeStart)) setFrom(defaults.timeStart);
       if (!preferenceTouched.current.to && defaults && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(defaults.timeEnd)) setTo(defaults.timeEnd);
     } catch (cause) {
-      if (mounted.current && requestId === sequence.current) setResolveError(cause instanceof Error ? cause.message : '餐厅详情暂时无法读取，请重试。');
-    } finally { if (mounted.current && requestId === sequence.current) setResolving(false); }
+      if (mounted.current && requestId === sequence.current && !controller.signal.aborted) {
+        setResolveError(cause instanceof Error ? cause.message : '餐厅详情暂时无法读取，请重试。');
+        if (!restaurant) setManualName(true);
+      }
+    } finally { if (mounted.current && requestId === sequence.current) { setResolving(false); lookup.current = null; } }
   }
   async function submit(event: FormEvent) {
-    event.preventDefault(); setError('');
+    event.preventDefault();
+    if (submitting.current) return;
+    setError('');
     try {
       const parsedUrl = validateRestaurantUrl(url);
       if (!selectedAccount?.enabled) throw new Error('请选择一个已启用账号。');
@@ -110,19 +125,21 @@ export function NewTaskModal({ onClose, onCreate, interval, currentDate, account
       if (pollError) throw new Error(pollError);
       if (mode === 'auto' && !consent) throw new Error('请先确认免费预订授权条件。');
       const dates = buildDates(start, end);
-      setBusy(true);
+      submitting.current = true; setBusy(true);
       await onCreate({ accountId: selectedAccountId, restaurantName: name.trim(), restaurantUrl: restaurant?.restaurantUrl ?? parsedUrl, dates, partySize: party, timeStart: from, timeEnd: to, mode, groupId: group.trim() || undefined, pollIntervalMs: Number(poll), ...(mode === 'auto' ? { autoConsent: true } : {}) });
       onClose();
     } catch (cause) { setError(cause instanceof Error ? cause.message : '创建失败，请重试。'); }
-    finally { if (mounted.current) setBusy(false); }
+    finally { submitting.current = false; if (mounted.current) setBusy(false); }
   }
   const canCreate = !!selectedAccount?.enabled && selectedAccount.taskCount < 5 && !!name.trim() && (!!restaurant || manualName);
+  const accountHint = selectedAccount ? !selectedAccount.enabled ? '此账号已停用，请先启用或选择其他账号。' : selectedAccount.taskCount >= 5 ? '此账号已有 5 个任务，请删除不需要的任务。' : !accountAuthenticated(selectedAccount) ? `${selectedAccount.taskCount}/5 个任务。可先创建，启动前请连接 Chrome 并核验登录。` : `${selectedAccount.taskCount}/5 个任务。创建后账号不可更改。` : '每个账号最多 5 个任务。';
   return <Modal title="新建订座任务" onClose={onClose} busy={busy}>
     <p className="modal-subtitle">粘贴餐厅链接，核验详情后即可按预填条件创建任务。</p>
     <form onSubmit={submit}>
+      <fieldset className="task-form-fields" disabled={busy}>
       <div className="form-grid">
-        <label className="field full">预约账号 <span className="required">*</span><select required aria-label="预约账号" value={selectedAccountId} onInput={event => changeAccount(event.currentTarget.value)} onChange={event => changeAccount(event.target.value)} disabled={busy}><option value="">请选择账号</option>{accounts.map(account => <option key={account.id} value={account.id} disabled={!account.enabled || account.taskCount >= 5}>{account.label} · {account.taskCount}/5 任务{!account.enabled ? ' · 已停用' : ''}</option>)}</select><span className="field-help">{selectedAccount ? `${selectedAccount.taskCount}/5 个任务。创建后账号不可更改。` : '每个账号最多 5 个任务。'}</span></label>
-        <label className="field full">餐厅链接 <span className="required">*</span><div className="restaurant-link-entry"><input data-autofocus type="url" required value={url} onInput={event => changeUrl(event.currentTarget.value)} onChange={event => changeUrl(event.target.value)} placeholder="https://www.catchtable.net/shop/..." autoComplete="off" disabled={busy} /><button type="button" className="button primary-outline" disabled={resolving || busy || !url.trim()} onClick={() => void resolveRestaurant()}>{resolving ? <><Icon name="refresh" className="spin" size={14} />核验中…</> : restaurant ? '重新核验' : resolveError ? '重试核验' : '核验餐厅'}</button></div><span className="field-help">读取真实公开详情并自动填写官方餐厅名，不会提交预约。</span>{resolveError ? <span className="restaurant-resolve-error" role="alert">{resolveError}</span> : null}{!restaurant ? <div className="restaurant-resolve-actions"><button type="button" className="text-button" disabled={busy || resolving} onClick={() => setManualName(value => !value)}>{manualName ? '返回链接核验' : '手动填写餐厅名'}</button>{manualName ? <span className="restaurant-manual-note">未核验餐厅详情，请自行核对官方页面。</span> : null}</div> : null}</label>
+        <label className="field full">预约账号 <span className="required">*</span><select required aria-label="预约账号" value={selectedAccountId} onInput={event => changeAccount(event.currentTarget.value)} onChange={event => changeAccount(event.target.value)} disabled={busy}><option value="">请选择账号</option>{accounts.map(account => <option key={account.id} value={account.id} disabled={!account.enabled || account.taskCount >= 5}>{account.label} · {account.taskCount}/5 任务{!account.enabled ? ' · 已停用' : ''}</option>)}</select><span className="field-help">{accountHint}</span></label>
+        <label className="field full">餐厅链接 <span className="required">*</span><div className="restaurant-link-entry"><input data-autofocus type="url" required value={url} onInput={event => changeUrl(event.currentTarget.value)} onChange={event => changeUrl(event.target.value)} placeholder="https://www.catchtable.net/shop/..." autoComplete="off" disabled={busy} /><button type="button" className="button primary-outline" disabled={busy || !url.trim()} onClick={() => resolving ? cancelResolve() : void resolveRestaurant()}>{resolving ? <><Icon name="refresh" className="spin" size={14} />取消等待</> : restaurant ? '重新核验' : resolveError ? '重试核验' : '核验餐厅'}</button></div><span className="field-help" role="status">{resolving ? '正在读取官方餐厅页，可停止等待并手动填写。' : '读取公开详情并填写餐厅名，不会提交预约。'}</span>{resolveError ? <span className="restaurant-resolve-error" role="alert">{resolveError}</span> : null}{!restaurant ? <div className="restaurant-resolve-actions"><button type="button" className="text-button" disabled={busy || resolving} onClick={() => setManualName(value => !value)}>{manualName ? '返回链接核验' : '手动填写餐厅名'}</button>{manualName ? <span className="restaurant-manual-note">请填写官网显示的餐厅名。</span> : null}{resolveError && /^https:\/\/(?:www\.)?catchtable\.net\//.test(url) ? <a className="text-button" href={url} target="_blank" rel="noreferrer">打开官方餐厅页<Icon name="external" size={12} /></a> : null}</div> : null}</label>
         {restaurant ? <div className="full"><RestaurantPreview key={restaurant.restaurantUrl} restaurant={restaurant} /></div> : null}
         {restaurant || manualName ? <label className="field full">餐厅名称 <span className="required">*</span><input required maxLength={100} value={name} onInput={event => setName(event.currentTarget.value)} onChange={event => setName(event.target.value)} placeholder="与 Catchtable 页面一致的官方餐厅名称" /><span className="field-help">{restaurant && name.trim() === restaurant.restaurantName ? '已从官方餐厅页自动填写。' : restaurant ? '名称已修改，请保持与官方页面一致，以便核验预订凭证。' : '手动名称尚未核验，请保持与官方页面一致。'}</span></label> : null}
       </div>
@@ -139,6 +156,7 @@ export function NewTaskModal({ onClose, onCreate, interval, currentDate, account
       <details className="task-advanced"><summary>高级参数 <span>检查间隔与互斥组</span></summary><div className="form-grid"><IntervalInput id="task-check-interval" className="full" value={poll} onChange={value => { intervalTouched.current = true; setPoll(value); }} /><label className="field full">互斥组 <span className="optional">选填</span><input maxLength={60} value={group} onInput={event => setGroup(event.currentTarget.value)} onChange={event => setGroup(event.target.value)} placeholder="例如：首尔周六晚餐" /><span className="field-help">同组任务只保留一笔已确认预订，适合同时关注备选餐厅。</span></label></div></details>
       <div className="soft-notice"><Icon name="info" size={17} /><span>创建后处于暂停状态，由你启动。餐厅时间以韩国时间（Asia/Seoul）为准，比北京时间快 1 小时。</span></div>
       {error ? <p className="form-error" role="alert">{error}</p> : null}
+      </fieldset>
       <div className="modal-footer"><button type="button" className="button" onClick={onClose} disabled={busy}>取消</button><button type="submit" className="button primary" disabled={busy || resolving || !canCreate}>{busy ? '正在创建…' : '创建暂停任务'}</button></div>
     </form>
   </Modal>;
