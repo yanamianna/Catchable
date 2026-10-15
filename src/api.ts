@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { AppState } from './types';
+import type { Account, AppState } from './types';
 
-export async function api<T = unknown>(path: string, body?: unknown, method?: string): Promise<T> {
+export async function api<T = unknown>(path: string, body?: unknown, method?: string, signal?: AbortSignal): Promise<T> {
   const requestMethod = (method ?? (body === undefined ? 'GET' : 'POST')).toUpperCase();
   const mutation = requestMethod !== 'GET' && requestMethod !== 'HEAD';
   const response = await fetch(path, {
+    signal,
     method: requestMethod,
     headers: mutation ? { 'Content-Type': 'application/json' } : undefined,
     body: mutation ? JSON.stringify(body ?? {}) : undefined,
@@ -16,36 +17,40 @@ export async function api<T = unknown>(path: string, body?: unknown, method?: st
   return result as T;
 }
 
-export function useAppState() {
-  const [state, setState] = useState<AppState | null>(null);
+export function useAppState(accountId = 'all') {
+  const [snapshot, setSnapshot] = useState<{ accountId: string; state: AppState } | null>(null);
+  const [accounts, setAccounts] = useState<Account[]>([]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const alive = useRef(true);
-  const pending = useRef<Promise<void> | null>(null);
+  const pending = useRef<AbortController | null>(null);
+  const sequence = useRef(0);
+  const scope = useRef(accountId);
+  scope.current = accountId;
   const refresh = useCallback(async () => {
-    if (pending.current) await pending.current;
     if (!alive.current) return;
-    const request = async () => {
-      try {
-        const next = await api<AppState>('/api/state');
-        if (alive.current) { setState(next); setError(''); }
-      } catch (cause) {
-        if (alive.current) setError(cause instanceof Error ? cause.message : '无法连接本地服务');
-      } finally {
-        if (alive.current) setLoading(false);
-      }
-    };
-    pending.current = request();
-    await pending.current;
-    pending.current = null;
+    pending.current?.abort();
+    const controller = new AbortController(); pending.current = controller;
+    const requestId = ++sequence.current; const requestedAccount = scope.current;
+    const current = () => alive.current && requestId === sequence.current && requestedAccount === scope.current;
+    try {
+      const next = await api<AppState>(`/api/state?accountId=${encodeURIComponent(requestedAccount)}`, undefined, undefined, controller.signal);
+      if (current()) { setSnapshot({ accountId: requestedAccount, state: next }); setAccounts(next.accounts ?? []); setError(''); }
+    } catch (cause) {
+      if (current() && !controller.signal.aborted) setError(cause instanceof Error ? cause.message : '无法连接本地服务');
+    } finally {
+      if (pending.current === controller) pending.current = null;
+      if (current()) setLoading(false);
+    }
   }, []);
   useEffect(() => {
     alive.current = true;
+    setLoading(true); setError('');
     void refresh();
     const interval = window.setInterval(() => { if (!pending.current) void refresh(); }, 1000);
-    return () => { alive.current = false; window.clearInterval(interval); };
-  }, [refresh]);
-  return { state, error, loading, refresh };
+    return () => { alive.current = false; sequence.current++; pending.current?.abort(); pending.current = null; window.clearInterval(interval); };
+  }, [accountId, refresh]);
+  return { state: snapshot?.accountId === accountId ? snapshot.state : null, accounts, error, loading, refresh };
 }
 
 export function formatTime(value?: string, detail = false) {

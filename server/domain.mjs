@@ -9,11 +9,30 @@ export class HttpError extends Error {
 export const isoNow = () => new Date().toISOString();
 export const identifier = (prefix) => `${prefix}_${randomUUID()}`;
 export const TASK_LIMIT = 5;
+export const DEFAULT_ACCOUNT_ID = 'default';
 export const TERMINAL_TASK_STATUSES = new Set(['confirmed', 'expired']);
 export const ACTIVE_TASK_STATUSES = new Set(['active', 'backoff']);
 export const PENDING_ATTEMPT_STATUSES = new Set(['submitting', 'outcome_unknown', 'user_action_required', 'pending_restaurant']);
 export const VERIFIABLE_ATTEMPT_STATUSES = new Set(['outcome_unknown', 'user_action_required', 'pending_restaurant']);
 export const BOOKING_CONTACT_DEFAULTS = Object.freeze({bookingPhoneCountryCode:'',bookingPhoneNumber:'',bookingPhoneAutoFill:false});
+export const ACCOUNT_SETTING_DEFAULTS = Object.freeze({
+  bookingName: '', ...BOOKING_CONTACT_DEFAULTS, browserIntegration: 'extension', browserChannel: 'chrome', pollIntervalMs: 1000, enginePaused: false,
+});
+export const ACCOUNT_SETTING_KEYS = Object.freeze(Object.keys(ACCOUNT_SETTING_DEFAULTS));
+
+export function validateAccountSettings(input = {}, current = {}) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new HttpError(400, '账号设置须为对象。');
+  if (Object.keys(input).some(key => !ACCOUNT_SETTING_KEYS.includes(key))) throw new HttpError(400, '包含不支持的账号设置。');
+  const settings = { ...ACCOUNT_SETTING_DEFAULTS, ...current, ...input };
+  if (typeof settings.bookingName !== 'string' || settings.bookingName.trim().length > 100 || /[\u0000-\u001f\u007f]/.test(settings.bookingName)) throw new HttpError(400, '预约姓名须为不超过 100 个字符的单行文字，可留空。');
+  settings.bookingName = settings.bookingName.trim();
+  Object.assign(settings, validateBookingContactSettings(settings));
+  if (!['extension', 'dedicated'].includes(settings.browserIntegration)) throw new HttpError(400, '账号浏览器连接方式无效。');
+  if (!['chrome', 'msedge'].includes(settings.browserChannel)) throw new HttpError(400, '账号浏览器须为 chrome 或 msedge。');
+  settings.pollIntervalMs = intervalMs(settings.pollIntervalMs);
+  if (typeof settings.enginePaused !== 'boolean') throw new HttpError(400, '账号暂停状态须为布尔值。');
+  return Object.fromEntries(ACCOUNT_SETTING_KEYS.map(key => [key, settings[key]]));
+}
 
 export function validateBookingContactSettings(input,current={}) {
   const settings={...BOOKING_CONTACT_DEFAULTS,...current,...input};

@@ -4,9 +4,9 @@ import { join } from 'node:path';
 import { HttpError, restaurantUrl, safeMessage } from './domain.mjs';
 import { BrowserProfileInUseError, initializeSessionRestorePreferences, launchManualBrowser, probeProfileOccupancy } from './browser-launch.mjs';
 import { parseRestaurantSnapshot, readRestaurantSnapshot, readRestaurantInformationSnapshot } from './restaurant.mjs';
-import { officialReservationRoute, recordStatus, knownConfirmationNotice, knownSameDayNotice, CHECKOUT_NAME, classifyCheckout, readBookingFlowDom } from './booking-flow.mjs';
+import { officialReservationRoute, recordStatus, knownConfirmationNotice, knownSameDayNotice, CHECKOUT_NAME, classifyCheckout, readBookingFlowDom, fillReservationName } from './booking-flow.mjs';
 import { parseReservationResponse, parseScheduledResponse, parseShopResponse } from './reservation-evidence.mjs';
-import { isOfficialUserInfo, parseSessionEvidence } from './session-evidence.mjs';
+import { isOfficialUserInfo, parseSessionEvidence, sessionIdentityFingerprint } from './session-evidence.mjs';
 import { connectExtensionContext } from './extension-context.mjs';
 
 const MONTHS = ['january','february','march','april','may','june','july','august','september','october','november','december'];
@@ -17,6 +17,7 @@ const MANUAL_GUIDANCE = ['点击「打开普通登录窗口」，在普通专用
 const EXTENSION_GUIDANCE=['在平常使用的 Chrome 中加载本机扩展并配对，保持 Chrome 和扩展连接打开。','在同一个 Chrome 中完成 Catchtable 官网登录，再点击「核验扩展登录」。无需关闭浏览器。'];
 
 function sessionFailureMessage(reason,fallback) {
+  if(reason==='identity_mismatch')return '当前官网登录身份与此账号绑定不一致，已停止该账号的自动操作。请断开连接后核对所选 Chrome 资料和账号。';
   if(reason==='http_401')return '官方账号接口返回 401：当前会话未获授权，暂不能自动订座。';
   if(reason==='http_403')return '官方账号接口返回 403：当前请求被官网拒绝，尚不能确认登录状态。';
   if(reason==='guest_response')return '官方账号接口返回 200，但明确显示未登录（isLogin=false）。当前页面会话尚未通过核验。';
@@ -28,6 +29,7 @@ export function classifySessionSnapshots(snapshots, { browserOpen = true, browse
   if (!browserOpen) return browserMode === 'extension'
     ? result('closed', 'Chrome 扩展页面尚未核验，请点击「核验扩展登录」。', ['保持当前 Chrome 打开，在扩展连接后核验登录。'])
     : result('closed', '专用浏览器尚未连接。', ['点击「打开普通登录窗口」，完成后关闭专用窗口，再点击「连接并核验登录」。']);
+  if((snapshots || []).some(snapshot=>snapshot.serverAuthRequired===true && snapshot.serverAuth?.status==='identity_mismatch'))return result('identity_mismatch',sessionFailureMessage('identity_mismatch'),['核对账号绑定与扩展所在 Chrome 资料后，断开并重新连接。']);
   let official = false;
   let loginRequired = false;
   let account;
@@ -246,11 +248,13 @@ function evidenceFromText(text, task, slot) {
 }
 
 export class CatchtableAdapter {
-  constructor({dataDir,contextFactory,manualBrowserLauncher=launchManualBrowser,publicContextFactory,profileOccupancyProbe,browserChannel,extensionBridge} = {}) {
+  constructor({dataDir,contextFactory,manualBrowserLauncher=launchManualBrowser,publicContextFactory,profileOccupancyProbe,browserChannel,extensionBridge,identityVerifier} = {}) {
     this.dataDir = dataDir || join(process.cwd(),'data'); this.contextFactory = contextFactory;
     this.manualBrowserLauncher = manualBrowserLauncher; this.publicContextFactory = publicContextFactory;
     this.profileOccupancyProbe = profileOccupancyProbe || (contextFactory ? async () => ({status:'free',ownerCount:0}) : probeProfileOccupancy);
     this.extensionBridge=extensionBridge;
+    if(identityVerifier!==undefined && typeof identityVerifier!=='function')throw new TypeError('identityVerifier must be a function');
+    this.identityVerifier=identityVerifier;this.identityRejected=false;
     this.defaultIntegration=extensionBridge?'extension':'dedicated';
     this.browserIntegration=this.defaultIntegration;
     this.browserMode = 'controlled'; this.browserChannel = browserChannel || process.env.CATCHABLE_BROWSER_CHANNEL || 'msedge';
@@ -309,8 +313,8 @@ export class CatchtableAdapter {
     const state={status:'unknown',request:null,pending:null,checkedAt:null};
     this.authStates.set(page,state);
     page.on('request',request=>{
-      if(request.isNavigationRequest() && request.frame()===page.mainFrame())Object.assign(state,{status:'unknown',accountLabel:undefined,evidenceReason:undefined,request:null,checkedAt:null});
-      if(request.method()==='GET' && isOfficialUserInfo(request.url()))Object.assign(state,{status:'unknown',accountLabel:undefined,evidenceReason:undefined,request,checkedAt:null});
+      if(request.isNavigationRequest() && request.frame()===page.mainFrame())Object.assign(state,{status:'unknown',accountLabel:undefined,identityFingerprint:undefined,evidenceReason:undefined,request:null,checkedAt:null});
+      if(request.method()==='GET' && isOfficialUserInfo(request.url()))Object.assign(state,{status:'unknown',accountLabel:undefined,identityFingerprint:undefined,evidenceReason:undefined,request,checkedAt:null});
     });
     page.on('response',response=>{
       if(!isOfficialUserInfo(response.url()) || response.request()!==state.request)return;
@@ -318,19 +322,37 @@ export class CatchtableAdapter {
       state.pending=(async()=>{
         let parsed;
         let evidenceReason;
+        let fingerprint;
         try {
           const status=response.status();
-          parsed=parseSessionEvidence(response.url(),status,status===200?await response.json():null);
+          const body=status===200?await response.json():null;
+          parsed=parseSessionEvidence(response.url(),status,body);
+          fingerprint=sessionIdentityFingerprint(response.url(),status,body);
+          if(parsed?.status==='authenticated' && this.identityVerifier && state.request===request)await this.identityVerifier(fingerprint);
           if(parsed?.status==='unauthenticated')evidenceReason=status===401?'http_401':status===403?'http_403':status===200?'guest_response':undefined;
         }
-        catch {parsed={status:'unknown'};}
-        if(state.request===request)Object.assign(state,parsed || {status:'unknown'},{evidenceReason,checkedAt:new Date().toISOString()});
+        catch(error) {
+          fingerprint=undefined;
+          parsed={status:error.code==='IDENTITY_MISMATCH'?'identity_mismatch':'unknown'};
+          if(parsed.status==='identity_mismatch') {this.identityRejected=true;evidenceReason='identity_mismatch';this.newTabAuth=null;}
+        }
+        if(state.request===request)Object.assign(state,{accountLabel:undefined,identityFingerprint:undefined},parsed || {status:'unknown'},{identityFingerprint:parsed?.status==='authenticated'?fingerprint:undefined,evidenceReason,checkedAt:new Date().toISOString()});
       })();
     });
     page.on('requestfailed',request=>{
-      if(request===state.request)Object.assign(state,{status:'unknown',accountLabel:undefined,evidenceReason:undefined,checkedAt:new Date().toISOString()});
+      if(request===state.request)Object.assign(state,{status:'unknown',accountLabel:undefined,identityFingerprint:undefined,evidenceReason:undefined,checkedAt:new Date().toISOString()});
     });
     return state;
+  }
+  async #pageIdentityReady(page) {
+    if(!this.identityVerifier)return true;
+    const state=this.#trackPageAuth(page);
+    if(state?.pending)await state.pending;
+    if(this.identityRejected || state?.status==='identity_mismatch') {
+      this.#cacheSession({status:'identity_mismatch',connected:false,browserOpen:Boolean(this.context),browserMode:this.browserMode,checkedAt:new Date().toISOString(),message:sessionFailureMessage('identity_mismatch'),guidance:[]});
+      return false;
+    }
+    return state?.status==='authenticated' && typeof state.identityFingerprint==='string';
   }
   #expectPageAuth(page) {
     const state=this.#trackPageAuth(page);
@@ -359,8 +381,9 @@ export class CatchtableAdapter {
     const page=this.bookingPages.get(taskId);
     if(!page || page.isClosed())return false;
     const state=this.#trackPageAuth(page);
+    if(this.identityRejected || state?.status==='identity_mismatch') {this.#cacheSession({status:'identity_mismatch',connected:false,browserOpen:true,browserMode:this.browserMode,checkedAt:new Date().toISOString(),message:sessionFailureMessage('identity_mismatch'),guidance:[]});return false;}
     if(state && state.status!=='authenticated')this.#cacheSession({status:state.status==='unauthenticated'?'unauthenticated':'unknown',connected:false,browserOpen:true,browserMode:'controlled',checkedAt:new Date().toISOString(),message:'当前订座页的官方会话核验未通过。',guidance:MANUAL_GUIDANCE});
-    return state?state.status==='authenticated':this.lastSession.status==='authenticated';
+    return state?state.status==='authenticated':!this.identityVerifier && this.lastSession.status==='authenticated';
   }
   #profileInUse() {
     this.browserMode='manual';
@@ -372,6 +395,7 @@ export class CatchtableAdapter {
   }
   async #launch() {
     if (this.context) return this.context;
+    this.identityRejected=false;
     if(this.browserIntegration==='extension') {
       if(!this.extensionBridge.state().connected)throw Object.assign(new Error('Chrome 扩展尚未连接。请先在平常使用的 Chrome 中加载扩展并完成本机配对。'),{code:'EXTENSION_DISCONNECTED'});
       this.context=this.contextFactory?await this.contextFactory({browserIntegration:'extension',bridge:this.extensionBridge}):await connectExtensionContext({bridge:this.extensionBridge});
@@ -476,12 +500,13 @@ export class CatchtableAdapter {
       this.newTabAuth=null;
       return this.lastSession.browserMode==='manual' && this.lastSession.browserOpen ? this.lastSession : this.#cacheSession(classifySessionSnapshots([],{browserOpen:false,browserMode:this.browserMode}));
     }
+    if(this.identityRejected)return this.#cacheSession({status:'identity_mismatch',connected:false,browserOpen:true,browserMode:this.browserMode,checkedAt:new Date().toISOString(),message:sessionFailureMessage('identity_mismatch'),guidance:[]});
     const snapshots=[];
     for(const page of this.context.pages?.() || []) {
       if(page.isClosed?.())continue;
       const auth=this.#trackPageAuth(page);
       if(auth?.pending)await auth.pending;
-      const metadata={primary:page===this.sessionPage,booking:[...this.bookingPages.values()].includes(page),serverAuthRequired:Boolean(auth),serverAuth:auth?{status:auth.status,evidenceReason:auth.evidenceReason,...(auth.accountLabel?{accountLabel:auth.accountLabel}:{})}:undefined};
+      const metadata={primary:page===this.sessionPage,booking:[...this.bookingPages.values()].includes(page),serverAuthRequired:Boolean(auth || this.identityVerifier),serverAuth:auth?{status:auth.status,evidenceReason:auth.evidenceReason,...(auth.accountLabel?{accountLabel:auth.accountLabel}:{})}:undefined};
       try {snapshots.push({...await page.evaluate(sessionSnapshotDom),...metadata});} catch {snapshots.push({url:page.url?.() || '',text:'',loading:true,...metadata});}
     }
     const observed=classifySessionSnapshots(snapshots,{browserOpen:true,browserMode:this.browserIntegration==='extension'?'extension':'controlled'});
@@ -515,7 +540,7 @@ export class CatchtableAdapter {
     const fresh=await this.observeSession();
     if(fresh.status!=='authenticated')return fresh;
     const newTab=await this.#verifyNewTabSession();
-    if(newTab && newTab.status!=='authenticated')return this.#cacheSession({...fresh,status:newTab.status,connected:false,message:'账号页与新页面的会话核验未全部通过，暂不能自动订座。请在所选专用浏览器登录后重新核验。',guidance:MANUAL_GUIDANCE});
+    if(newTab && newTab.status!=='authenticated')return this.#cacheSession({...fresh,status:newTab.status,connected:false,message:newTab.status==='identity_mismatch'?sessionFailureMessage('identity_mismatch'):'账号页与新页面的会话核验未全部通过，暂不能自动订座。请在所选专用浏览器登录后重新核验。',guidance:MANUAL_GUIDANCE});
     return this.#cacheSession({...fresh,...(newTab?{newTabVerified:true,newTabCheckedAt:newTab.checkedAt,message:'当前账号及新页面均已通过官方会话核验，可以自动订座。'}:{})});
   }
   async resolveRestaurant(value) {
@@ -620,6 +645,7 @@ export class CatchtableAdapter {
     const authReady=this.#expectPageAuth(page);
     await page.goto(url,{waitUntil:'domcontentloaded',timeout:30000});
     const auth=await authReady;
+    if(!await this.#pageIdentityReady(page))throw new Error('AUTH_REQUIRED');
     if(auth && auth.status!=='authenticated') {
       this.#cacheSession({status:auth.status==='unauthenticated'?'unauthenticated':'unknown',connected:false,browserOpen:true,browserMode:'controlled',checkedAt:new Date().toISOString(),
         message:auth.status==='unauthenticated'?'当前餐厅页面的官方会话核验显示未登录。':'当前餐厅页面没有取得新的官方会话核验结果。',guidance:MANUAL_GUIDANCE});
@@ -757,6 +783,7 @@ export class CatchtableAdapter {
     if(!inspected || inspected.inspectionId!==inspectionId || Date.now()-inspected.checkedAt>5000 || inspected.conditions!==this.#inspectionConditions(task)
       || inspected.page.isClosed() || this.watchPages.get(task.id)!==inspected.page || !this.context?.pages?.().includes(inspected.page))return null;
     try {
+      if(!await this.#pageIdentityReady(inspected.page))return null;
       const auth=this.#trackPageAuth(inspected.page);
       if(auth && auth.status!=='authenticated')return null;
       if(!await inspected.dialog.isVisible())return null;
@@ -769,6 +796,7 @@ export class CatchtableAdapter {
     }catch {return null;}
   }
   async #receipt(page, task, slot) {
+    if(!await this.#pageIdentityReady(page))return null;
     if(typeof page.evaluate==='function') {
       const snapshot=await page.evaluate(readBookingFlowDom);
       return parseOfficialBookingRecord(snapshot,task,slot);
@@ -812,6 +840,7 @@ export class CatchtableAdapter {
     page.on('requestfailed',failed);
     return {read:async()=>{
       await Promise.allSettled([...captured.pending]);
+      if(!await this.#pageIdentityReady(page))return {record:null,complete:false,responseStatus:captured.responseStatus,responseKeys:captured.responseKeys,networkError:'当前订单页尚未通过此账号的官方身份核验。'};
       if(captured.detail)for(const shopEvidence of captured.shops){
         const parsed=parseReservationResponse(captured.detail.url,captured.detail.json,task,slot,expectedId,shopEvidence);
         if(parsed)captured.records.push(parsed);
@@ -823,6 +852,7 @@ export class CatchtableAdapter {
     const checkPage=await this.context.newPage();
     const observation=this.#observeOrders(checkPage,task,slot,expectedId);
     try {
+      const identityReady=this.identityVerifier?this.#expectPageAuth(checkPage):Promise.resolve(null);
       const url=expectedId?`https://www.catchtable.net/zh-CN/customer/reservation/detail/${encodeURIComponent(expectedId)}`:'https://www.catchtable.net/zh-CN/my-dining/scheduled';
       const responseReady=checkPage.waitForResponse(response=>{
         try {const target=new URL(response.url());return target.origin==='https://api.catchtable.net' && target.pathname===(expectedId?'/api/v5/reservation/detail':'/api/v6/my-dining/scheduled');}catch{return false;}
@@ -831,6 +861,8 @@ export class CatchtableAdapter {
         try {const target=new URL(response.url());return target.origin==='https://api.catchtable.net' && target.pathname==='/api/v5/shop/detail' && response.status()===200;}catch{return false;}
       },{timeout:20000}).catch(()=>null):Promise.resolve(null);
       await checkPage.goto(url,{waitUntil:'domcontentloaded',timeout:30000});
+      await identityReady;
+      if(!await this.#pageIdentityReady(checkPage))return {record:null,complete:false,networkError:'当前订单页尚未通过此账号的官方身份核验。'};
       const primaryResponse=await responseReady;
       if(primaryResponse && primaryResponse.status()!==200)return {record:null,complete:false,responseStatus:primaryResponse.status()};
       const responses=[primaryResponse,await shopReady];
@@ -877,6 +909,7 @@ export class CatchtableAdapter {
     const blocked=(message,phase='before_submit')=>({status:'user_action_required',phase,submitted:false,message,diagnostics});
     try {
       for(let step=0;step<7;step++) {
+        if(!await this.#pageIdentityReady(page))return blocked(this.identityRejected?sessionFailureMessage('identity_mismatch'):'当前订座页面尚未通过此账号的官方身份核验，未继续预约。','authentication');
         const captured=observation?await observation.read():{};
         if(captured.record)return captured.record;
         const existing=await this.#receipt(page,task,slot);
@@ -938,6 +971,12 @@ export class CatchtableAdapter {
         diagnostics.checkoutName=requirements.checkoutName;
         diagnostics.checkoutBlocker=requirements.blocker;
         diagnostics.missingRequiredFields=snapshot.missingRequiredFields;
+        if(bookingContact?.fullName && task.mode==='auto' && task.autoConsent===true && matched && !snapshot.loading
+          && !requirements.requiresPayment && !requirements.requiresConsent && !requirements.requiresCaptcha) {
+          const name=await fillReservationName(page,snapshot,bookingContact.fullName);
+          if(name==='blocked')return blocked('预约姓名字段不唯一、只读或不能准确填写；请在官网当前预约表单核对，系统不会修改个人资料。','required_fields');
+          if(name==='filled')continue;
+        }
         if(snapshot.phoneField?.required && snapshot.phoneField.empty && bookingContact && task.mode==='auto' && task.autoConsent===true
           && matched && !snapshot.loading && !requirements.requiresPayment && !requirements.requiresConsent && !requirements.requiresCaptcha
           && requirements.blocker==='required_fields' && snapshot.missingRequiredFields.every(field=>field==='电话号码')
@@ -958,8 +997,8 @@ export class CatchtableAdapter {
         const checkout=page.getByRole('button',{name:requirements.checkoutName,exact:true});
         if(await checkout.count()!==1 || !await checkout.isEnabled())return blocked('免费预约结账按钮尚未启用，官方表单仍有必填资料或保留时间已失效。');
         const auth=this.#trackPageAuth(page);
-        if(auth && auth.status!=='authenticated') {
-          this.#cacheSession({status:auth.status==='unauthenticated'?'unauthenticated':'unknown',connected:false,browserOpen:true,browserMode:'controlled',checkedAt:new Date().toISOString(),message:'当前订座表单尚未通过新的官方会话核验。',guidance:MANUAL_GUIDANCE});
+        if(!await this.#pageIdentityReady(page) || (auth && auth.status!=='authenticated')) {
+          if(!this.identityRejected)this.#cacheSession({status:auth?.status==='unauthenticated'?'unauthenticated':'unknown',connected:false,browserOpen:true,browserMode:'controlled',checkedAt:new Date().toISOString(),message:'当前订座表单尚未通过新的官方会话核验。',guidance:MANUAL_GUIDANCE});
           return blocked('当前订座表单没有有效登录会话，未提交预约。','authentication');
         }
         if(typeof onBeforeSubmit!=='function')return blocked('提交前持久登记不可用，未提交预约。');
@@ -989,6 +1028,7 @@ export class CatchtableAdapter {
     }
   }
   async prepare(task, slot, options={}) {
+    if(this.identityRejected)return {status:'user_action_required',phase:'authentication',submitted:false,message:sessionFailureMessage('identity_mismatch')};
     const inspected=typeof options.inspectionId==='string'?await this.#reuseInspection(task,slot,options.inspectionId):null;
     const page = inspected?.page || await this.#page(task,true);
     if (!page) return {status:'user_action_required',phase:'authentication',submitted:false,message:'请先在专用浏览器登录。'};

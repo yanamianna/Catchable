@@ -90,6 +90,21 @@ test('pairing uses the fixed local WebSocket endpoint and keeps the code out of 
   assert.equal(keepalive.duration, 20000); keepalive.callback(); assert.equal(socket.sent.at(-1).type, 'ping');
 });
 
+test('server account labels are displayed safely and switching pairing never adopts the previous account tabs',async()=>{
+  const fixture=await worker();const socket=await fixture.connect();const owned=await fixture.create();
+  await socket.onmessage({data:JSON.stringify({type:'hello_ack',accountLabel:'Synthetic account A'})});
+  assert.equal((await fixture.message({type:'status'})).accountLabel,'Synthetic account A');
+  await fixture.message({type:'connect',pairingCode:'different_fixture_pairing_0123456789'});
+  const next=fixture.sockets.at(-1);next.open();
+  assert.equal((await fixture.message({type:'status'})).accountLabel,null);
+  assert.ok(fixture.tabs.has(owned.tabId),'switching account preserves its former tabs');
+  assert.equal((await fixture.command('Target.getTargets')).result.targetInfos.length,0);
+  assert.ok((await fixture.command('Target.attachToTarget',{targetId:owned.targetId})).error);
+  await next.onmessage({data:JSON.stringify({type:'hello_ack',accountLabel:'Synthetic account B'})});
+  assert.equal((await fixture.message({type:'status'})).accountLabel,'Synthetic account B');
+  assert.equal(fixture.calls.filter(call=>call.api==='remove').length,0);
+});
+
 test('virtual target and session commands control only new owned tabs and never close Chrome', async () => {
   const fixture = await worker(); await fixture.connect(); const owned = await fixture.create();
   const attached = fixture.sockets[0].sent.find(value => value.method === 'Target.attachedToTarget');

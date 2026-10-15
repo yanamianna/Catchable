@@ -6,6 +6,7 @@ const pages: { id: Page; label: string; icon: string }[] = [
   { id: 'tasks', label: '订座任务', icon: 'calendar' },
   { id: 'bookings', label: '预约记录', icon: 'record' },
   { id: 'notifications', label: '通知中心', icon: 'bell' },
+  { id: 'accounts', label: '账号管理', icon: 'link' },
   { id: 'settings', label: '运行设置', icon: 'settings' },
 ];
 
@@ -21,8 +22,8 @@ export function Activity({ state, clearing = false, onClear }: { state: AppState
   const events = state?.events.slice(0, 5) ?? [];
   return <aside className="activity" aria-label="运行动态">
     <div className="activity-heading"><h2>运行动态</h2>{onClear ? <button type="button" className="text-button clear-records" disabled={clearing || !events.length} onClick={onClear}>{clearing ? '清除中…' : '清除动态'}</button> : null}</div>
-    {events.length ? <div className="activity-events">{events.map(event => <div className="activity-event" key={event.id}><span className={`activity-dot ${event.level === 'error' ? 'danger' : ['warn', 'warning'].includes(event.level) ? 'warning' : 'green'}`} /><div><p>{event.source === 'demo' ? <span className="badge demo">演练</span> : null}{event.message}</p><time dateTime={event.createdAt}>{formatTime(event.createdAt)}</time></div></div>)}</div> : <p className="activity-empty">{state ? '暂无运行动态' : '连接本地服务中…'}</p>}
+    {events.length ? <div className="activity-events">{events.map(event => <div className="activity-event" key={event.id}><span className={`activity-dot ${event.level === 'error' ? 'danger' : ['warn', 'warning'].includes(event.level) ? 'warning' : 'green'}`} /><div><p>{event.accountLabel ? <span className="account-chip">{event.accountLabel}</span> : null}{event.source === 'demo' ? <span className="badge demo">演练</span> : null}{event.message}</p><time dateTime={event.createdAt}>{formatTime(event.createdAt)}</time></div></div>)}</div> : <p className="activity-empty">{state ? '暂无运行动态' : '连接本地服务中…'}</p>}
     <div className="activity-help"><Icon name="info" size={20} /><p>支付或验证码需要你处理。</p></div>
-    {state?.engine.accountWriteBlocked ? <div className="lock-notice">预订结果待核验，自动提交已暂停。</div> : null}
+    {state?.engine.accountWriteBlocked ? <div className="lock-notice">有账号预订待核验，该账号暂缓自动提交。</div> : null}
   </aside>;
 }

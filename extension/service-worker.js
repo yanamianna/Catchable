@@ -18,6 +18,7 @@ let retryCount = 0;
 let reconnectTimer = null;
 let keepaliveTimer = null;
 let currentStatus = { status: 'disconnected', message: '请从本地控制台获取配对码后连接。' };
+let accountLabel = null;
 
 function officialPage(url, blank = false) {
   if (blank && url === 'about:blank') return true;
@@ -33,7 +34,7 @@ function officialResponse(url) {
   } catch { return false; }
 }
 function pairingCode(value) { return typeof value === 'string' && /^[A-Za-z0-9_-]{24,128}$/.test(value); }
-function status() { return { ...currentStatus, enabled, ownedTabs: ownedTabs.size, attachedTabs: tabSessions.size, checkedAt: new Date().toISOString() }; }
+function status() { return { ...currentStatus, accountLabel, enabled, ownedTabs: ownedTabs.size, attachedTabs: tabSessions.size, checkedAt: new Date().toISOString() }; }
 function setStatus(value, message) { currentStatus = { status: value, message }; }
 function send(value, transport = socket) {
   if (transport && transport === socket && transport.readyState === WebSocket.OPEN) transport.send(JSON.stringify(value));
@@ -203,7 +204,7 @@ async function dispatch(command) {
 }
 function clearTimers() { if (keepaliveTimer) clearInterval(keepaliveTimer); if (reconnectTimer) clearTimeout(reconnectTimer); keepaliveTimer = null; reconnectTimer = null; }
 async function stopConnection(message = '已断开，保留所有 Chrome 标签页。', persist = true) {
-  enabled = false; generation++; clearTimers();
+  enabled = false; generation++; clearTimers(); accountLabel = null;
   if (persist) await chrome.storage.local.set({ connectionEnabled: false });
   const previous = socket; socket = null; previous?.close();
   await detachAll(); autoAttach = false; discover = false;
@@ -232,6 +233,10 @@ async function connectSocket() {
   transport.onmessage = async (message) => {
     if (socket !== transport || epoch !== generation) return;
     let command; try { command = JSON.parse(message.data); } catch { return; }
+    if (command?.type === 'hello_ack') {
+      accountLabel = typeof command.accountLabel === 'string' && command.accountLabel.trim() ? command.accountLabel.trim().slice(0,100) : null;
+      return;
+    }
     if (command.type !== 'command' || !Number.isSafeInteger(command.id) || command.id < 0 || activeCommands.has(command.id)) return;
     activeCommands.add(command.id);
     try {
@@ -243,7 +248,7 @@ async function connectSocket() {
   };
   transport.onclose = async (closed) => {
     if (socket !== transport) return;
-    socket = null; generation++; if (keepaliveTimer) clearInterval(keepaliveTimer); keepaliveTimer = null;
+    socket = null; generation++; accountLabel = null; if (keepaliveTimer) clearInterval(keepaliveTimer); keepaliveTimer = null;
     await detachAll(); autoAttach = false; discover = false;
     if (closed.code === 1008) { enabled = false; await chrome.storage.local.set({ connectionEnabled: false }); setStatus('error', '配对被拒绝，请从本地控制台重新获取配对码。'); return; }
     setStatus('disconnected', enabled ? '本机连接中断，等待重新连接；不会重放预约操作。' : '已断开。');
@@ -330,6 +335,9 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       const code = message.pairingCode?.trim() || saved.pairingCode;
       if (!pairingCode(code)) throw new Error('请粘贴有效的本地配对码。');
       await stopConnection('正在重新连接…', false);
+      // Switching accounts must not adopt the preceding account's pages.
+      // Leave those tabs open, detach them, and create fresh owned tabs.
+      if (saved.pairingCode !== code) { ownedTabs.clear(); await persistOwned(); }
       await chrome.storage.local.set({ pairingCode: code, connectionEnabled: true });
       enabled = true; await connectSocket(); return status();
     }

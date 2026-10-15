@@ -7,7 +7,7 @@ export type LoginMode = 'manual' | 'controlled';
 export type SessionAction = (action: 'open' | 'check', mode?: LoginMode) => void;
 const labels: Record<string, string> = { closed: '浏览器未连接', manual_login: '等待手动登录', profile_in_use: '请先关闭专用窗口', connecting: '正在连接', authenticated: '已核验登录', unauthenticated: '未登录', oauth_blocked: 'Google 登录受阻', unknown: '登录状态待核验' };
 
-export function SessionPanel({ state, busy, onSession, compact = false, onManage }: { state: AppState | null; busy: boolean; onSession: SessionAction; compact?: boolean; onManage?: () => void }) {
+export function SessionPanel({ state, accountId, busy, onSession, compact = false, onManage }: { state: Pick<AppState, 'settings' | 'session' | 'extension'> | null; accountId?: string; busy: boolean; onSession: SessionAction; compact?: boolean; onManage?: () => void }) {
   const session = state?.session;
   const integration = state?.settings.browserIntegration ?? session?.browserIntegration ?? 'extension';
   const isExtension = integration === 'extension';
@@ -23,12 +23,13 @@ export function SessionPanel({ state, busy, onSession, compact = false, onManage
   const [pairingBusy, setPairingBusy] = useState(false);
   const [pairingMessage, setPairingMessage] = useState('');
   const pairingRequest = useRef(0);
-  useEffect(() => { pairingRequest.current++; setPairingCode(''); setPairingMessage(''); setPairingBusy(false); return () => { pairingRequest.current++; }; }, [integration]);
+  useEffect(() => { pairingRequest.current++; setPairingCode(''); setPairingMessage(''); setPairingBusy(false); return () => { pairingRequest.current++; }; }, [integration, accountId]);
   async function showPairingCode() {
     const request = ++pairingRequest.current;
     setPairingBusy(true); setPairingMessage('');
     try {
-      const result = await api<{ pairingCode: string; extensionPath: string }>('/api/extension/pairing');
+      if (!accountId || accountId === 'all') throw new Error('请先选择一个账号。');
+      const result = await api<{ pairingCode: string; extensionPath: string }>(`/api/accounts/${encodeURIComponent(accountId)}/pairing`);
       if (request !== pairingRequest.current) return;
       if (typeof result.pairingCode !== 'string' || !result.pairingCode) throw new Error('本地服务未返回配对码，请重试。');
       setPairingCode(result.pairingCode);
@@ -40,7 +41,7 @@ export function SessionPanel({ state, busy, onSession, compact = false, onManage
     try { await navigator.clipboard.writeText(pairingCode); setPairingMessage('配对码已复制，请粘贴到 Chrome 扩展弹窗。'); }
     catch { setPairingMessage('浏览器未能复制配对码，请允许剪贴板权限后重试。'); }
   }
-  const sessionDisabled = busy || !state || (isExtension && !extensionConnected);
+  const sessionDisabled = busy || !state || !accountId || (isExtension && !extensionConnected);
   const message = isExtension && !extensionConnected ? state?.extension?.message || '在登录设置中安装并配对扩展。' : session?.message;
   const needsSetup = isExtension ? !extensionConnected : ['closed', 'manual_login', 'profile_in_use', 'oauth_blocked'].includes(status);
   return <section className={`session-panel ${compact ? 'compact' : 'settings-card'}`} aria-label="Catchtable 登录状态" aria-busy={busy}>

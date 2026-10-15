@@ -7,6 +7,9 @@ const error = document.querySelector('#error');
 let busy = false;
 const labels = { disconnected: '尚未连接', connecting: '连接中', connected: '已连接本机', error: '需要处理' };
 function render(state) {
+  const account = document.querySelector('#account-label');
+  account.hidden = state.status !== 'connected' || !state.accountLabel;
+  account.textContent = account.hidden ? '' : `当前账号：${state.accountLabel}`;
   document.querySelector('#status-label').textContent = labels[state.status] || '尚未连接';
   document.querySelector('#status-message').textContent = state.message || '';
   document.querySelector('#status-dot').dataset.status = state.status;

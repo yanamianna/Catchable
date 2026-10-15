@@ -2,11 +2,12 @@ import { request } from 'node:https';
 import { ACTIVE_TASK_STATUSES, BOOKING_CONTACT_DEFAULTS, HttpError, PENDING_ATTEMPT_STATUSES, TERMINAL_TASK_STATUSES, VERIFIABLE_ATTEMPT_STATUSES, createTask, intervalMs, matchingSlots, restaurantUrl, safeMessage, localDate, validateBookingContactSettings, validateWebhookUrl } from './domain.mjs';
 
 export class Engine {
-  constructor({ store, adapter, now = Date.now, deliverWebhook = defaultWebhookDelivery }) {
+  constructor({ store, adapter, now = Date.now, deliverWebhook = defaultWebhookDelivery, managed = false }) {
     this.store = store;
     this.adapter = adapter;
     this.now = now;
     this.deliverWebhook = deliverWebhook;
+    this.managed = managed;
     this.timer = null;
     this.notificationTimer = null;
     this.sessionTimer = null;
@@ -53,12 +54,12 @@ export class Engine {
     this.stopped = false;
     this.schedulerActive = true;
     this.schedule();
-    if (!this.notificationTimer) this.notificationTimer = setInterval(() => {
+    if (!this.managed && !this.notificationTimer) this.notificationTimer = setInterval(() => {
       if (!this.deliveryPromise && !this.stopped) {
         this.deliveryPromise = this.deliverOneNotification().catch(() => {}).finally(() => { this.deliveryPromise = null; });
       }
     }, 2000);
-    if (!this.sessionTimer) this.sessionTimer = setInterval(() => {
+    if (!this.managed && !this.sessionTimer) this.sessionTimer = setInterval(() => {
       this.refreshSession().catch(() => {});
     }, 10000);
     this.timer?.unref();
@@ -273,7 +274,7 @@ export class Engine {
     this.event(task, 'booking_started', '已记录本次预约尝试，结果确认前不会重复提交。', 'info', { bookingId: attempt.id, slot });
     let result;
     this.currentTaskId=task.id;
-    try { result = await adapter.prepare(task, slot, {onBeforeSubmit:this.beforeSubmit(attempt),...this.bookingContactOptions(task),...(typeof inspectionId==='string'?{inspectionId}:{})}); }
+    try { result = await adapter.prepare(task, slot, {onBeforeSubmit:this.beforeSubmit(attempt),...this.bookingContactOptions(task,attempt),...(typeof inspectionId==='string'?{inspectionId}:{})}); }
     catch (error) { result = { status: 'outcome_unknown', message: safeMessage(error, '提交结果不明，请核验已有预约。') }; }
     finally {this.currentTaskId=null;}
     if(result?.phase==='authentication' && this.adapter.lastSession)this.applySession(this.adapter.lastSession);
@@ -372,7 +373,7 @@ export class Engine {
     const current=this.store.getAttempt(attempt.id);
     const task=this.store.getTask(attempt.taskId);
     const before=record=>record?.status==='user_action_required' && ['before_submit','authentication'].includes(record.phase) && record.submitted===false && !record.reservationId;
-    return result?.resumeAllowed===true && before(attempt) && before(current) && before(result)
+    return attempt.legacyIdentityUnverified!==true && result?.resumeAllowed===true && before(attempt) && before(current) && before(result)
       && task?.source==='live' && task.mode==='auto' && task.autoConsent===true && task.status!=='paused' && task.status!=='expired'
       && Date.parse(task.deadline)>this.now() && current.slot.date>=localDate(this.now()) && !this.stopped && !this.store.settings().enginePaused
       && this.session.status==='authenticated' && this.session.connected===true && adapter.hasContext===true && typeof adapter.continueAttempt==='function';
@@ -385,6 +386,7 @@ export class Engine {
       used=true;
       const task=this.task(attempt.taskId);
       const current=this.store.getAttempt(attempt.id);
+      if(current?.legacyIdentityUnverified===true)throw new HttpError(409,'旧预约尚未保存原账号身份，只能先在官网核验并处理，不能自动继续提交。');
       if(!current || current.source!=='live' || task.source!=='live' || task.mode!=='auto' || task.autoConsent!==true)throw new HttpError(409,'这次尝试没有真实自动预约授权，不能提交。');
       if(this.session.status!=='authenticated' || this.session.connected!==true || this.adapter.hasContext!==true)throw Object.assign(new HttpError(409,'请先连接并核验官方登录会话；会话有效且专用浏览器已连接时才能提交。'),{code:'AUTH_REQUIRED'});
       if(typeof this.adapter.isBookingAuthenticated==='function' && !this.adapter.isBookingAuthenticated(task.id)) {
@@ -405,12 +407,17 @@ export class Engine {
     };
   }
 
-  bookingContactOptions(task) {
+  bookingContactOptions(task,attempt) {
     if(task.source!=='live' || task.mode!=='auto' || task.autoConsent!==true)return {};
+    if(attempt && Object.hasOwn(attempt,'contactSnapshot')) {
+      const contact=attempt.contactSnapshot;
+      if(!contact || contact.autoFill!==true)return {};
+      return {bookingContact:{countryCode:contact.countryCode,phoneNumber:contact.phoneNumber,...(contact.name?{fullName:contact.name}:{})}};
+    }
     const settings=this.store.settings();
     if(settings.bookingPhoneAutoFill!==true)return {};
     const contact=validateBookingContactSettings({},settings);
-    return {bookingContact:{countryCode:contact.bookingPhoneCountryCode,phoneNumber:contact.bookingPhoneNumber}};
+    return {bookingContact:{countryCode:contact.bookingPhoneCountryCode,phoneNumber:contact.bookingPhoneNumber,...(settings.bookingName?{fullName:settings.bookingName}:{})}};
   }
 
   async continueAutoTask(task,adapter=this.adapter,{automatic=false,attemptId=null}={}) {
@@ -425,7 +432,7 @@ export class Engine {
     }
     this.currentTaskId=task.id;
     let result;
-    try {result=await adapter.continueAttempt({...attempt,task:attempt.taskSnapshot || task,legacyBeforeSubmit:automatic?false:this.legacyBeforeSubmit(attempt)},{onBeforeSubmit:this.beforeSubmit(attempt),...this.bookingContactOptions(task)});}
+    try {result=await adapter.continueAttempt({...attempt,task:attempt.taskSnapshot || task,legacyBeforeSubmit:automatic?false:this.legacyBeforeSubmit(attempt)},{onBeforeSubmit:this.beforeSubmit(attempt),...this.bookingContactOptions(task,attempt)});}
     catch(error){
       const current=this.store.getAttempt(attempt.id);
       result=error.code==='AUTH_REQUIRED' && current?.submitted===false && !current.reservationId
@@ -469,7 +476,7 @@ export class Engine {
   }
 
   applySession(value, { resumeAuth = false } = {}) {
-    const status = ['closed','manual_login','profile_in_use','connecting','authenticated','unauthenticated','oauth_blocked','unknown'].includes(value?.status) ? value.status : 'unknown';
+    const status = ['closed','manual_login','profile_in_use','connecting','authenticated','unauthenticated','oauth_blocked','identity_mismatch','unknown'].includes(value?.status) ? value.status : 'unknown';
     this.session = { status, connected:status==='authenticated', browserOpen:value?.browserOpen===true,
       browserMode:['controlled','extension'].includes(value?.browserMode)?value.browserMode:'manual', checkedAt:value?.checkedAt || this.timestamp(),
       message:value?.message || '登录状态尚未核验。', guidance:Array.isArray(value?.guidance)?value.guidance:[],
@@ -590,7 +597,7 @@ export class Engine {
     const updated = { ...notice, attempts: notice.attempts + 1, updatedAt: this.timestamp() };
     try {
       if (!url) throw new Error('通知渠道已移除。');
-      await this.deliverWebhook(url, { eventId: notice.eventId, message: notice.message, slot: notice.slot, restaurantUrl: notice.restaurantUrl, observedAt: notice.createdAt,
+      await this.deliverWebhook(url, { eventId: notice.eventId, ...(notice.accountId?{accountId:notice.accountId,accountLabel:this.store.getAccount?.()?.label || '默认账号'}:{}), message: notice.message, slot: notice.slot, restaurantUrl: notice.restaurantUrl, observedAt: notice.createdAt,
         deliveryMeaning: '发送入口接受请求不代表手机已收到。' });
       this.store.saveNotification({ ...updated, status: 'accepted', nextAttemptAt: null, acceptedAt: this.timestamp(), lastError: null });
     } catch (error) {

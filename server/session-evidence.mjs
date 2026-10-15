@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 export function isOfficialUserInfo(value) {
   try {
     const url=new URL(value);
@@ -6,6 +8,13 @@ export function isOfficialUserInfo(value) {
     const locale=url.searchParams.get('localeCode');
     return locale===null || /^[A-Za-z0-9_-]{1,20}$/.test(locale);
   }catch{return false;}
+}
+
+// Internal identity binding only. The raw official identifier and this digest
+// must never be added to session, diagnostics, events, or API responses.
+export function sessionIdentityFingerprint(url,status,body) {
+  if(parseSessionEvidence(url,status,body)?.status!=='authenticated')return null;
+  return createHash('sha256').update(`catchtable-user-v1\0${String(body.ctUserIdentifier).trim()}`).digest('hex');
 }
 
 // Read only the normal document bootstrap's account response. Never export

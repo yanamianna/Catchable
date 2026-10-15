@@ -113,7 +113,21 @@ export function readBookingFlowDom() {
   const phoneRequired=Boolean(phoneHeading && visible(phoneHeading)
     && /(?:电话号码|Phone (?:number|Number))/i.test(phoneHeading.innerText)
     && /\*\s*(?:必填|Required)/i.test(phoneHeading.innerText));
-  const missingRequired=[...document.querySelectorAll('input[required],textarea[required],select[required],[aria-required="true"]')].filter(visible).filter(element=>!element.value?.trim()).map(element=>element.getAttribute('aria-label') || element.name || '必填信息');
+  const nameLabel=/^(?:预约人|预订人|预约姓名|预订姓名|姓名|Full name|Guest name|Booker name|Reservation name|Name|예약자명|예약자 이름|이름)(?:\s*\*?\s*(?:必填|Required|필수))?\s*\*?$/i;
+  const inputs=[...document.querySelectorAll('input')].filter(visible);
+  const names=officialForm() ? inputs.filter(element=>{
+    if(!['text',''].includes(element.getAttribute('type') || '') && element.type!=='text')return false;
+    const explicit=[element.getAttribute('aria-label'),element.getAttribute('placeholder'),...Array.from(element.labels || [],label=>label.innerText?.trim())].filter(Boolean);
+    const heading=element.closest('section')?.querySelector('h3');
+    if(heading && visible(heading))explicit.push(heading.innerText.trim());
+    return element.autocomplete==='name' || /^(?:full_?name|guest_?name|booker_?name|reservation_?name|name)$/i.test(element.name || '') || explicit.some(value=>nameLabel.test(value));
+  }):[];
+  function officialForm() {
+    return location.protocol==='https:' && ['www.catchtable.net','catchtable.net'].includes(location.hostname) && !location.port
+      && /^\/(?:[a-z]{2}(?:-[A-Za-z]{2})?\/)?reservation\/form\/?$/.test(location.pathname);
+  }
+  const missingRequired=[...document.querySelectorAll('input[required],textarea[required],select[required],[aria-required="true"]')].filter(visible).filter(element=>!element.value?.trim()).map(element=>names.includes(element)?'预约姓名':element.getAttribute('aria-label') || element.name || '必填信息');
+  for(const name of names)if(!name.value?.trim() && /\*\s*(?:必填|Required|필수)/i.test(name.closest('section')?.querySelector('h3')?.innerText || ''))missingRequired.push('预约姓名');
   if(phoneRequired && !phone.value?.trim())missingRequired.push('电话号码');
   return {url:location.href,text:text.slice(0,40000),buttons:buttons(document),
     headings:[...document.querySelectorAll('h1,h2,h3,h4')].filter(visible).map(element=>element.innerText.trim()),
@@ -124,6 +138,26 @@ export function readBookingFlowDom() {
     captcha:Boolean([...document.querySelectorAll('iframe[src*="captcha"], [id*="captcha"]')].find(visible)),
     uncheckedAgreements:unchecked.filter(element=>!/(?:不再显示|Don't show again|Do not show again)/i.test(labels(element))).map(labels),
     missingRequiredFields:missingRequired,
+    nameFields:names.map(element=>({index:inputs.indexOf(element),empty:!element.value?.trim(),readOnly:Boolean(element.readOnly),disabled:Boolean(element.disabled)})),
     phoneField:phone?{required:phoneRequired,empty:!phone.value?.trim(),countryCode:phone.previousElementSibling?.innerText.trim() || ''}:null,
     cards:[...document.querySelectorAll('a[href*="/customer/reservation/detail/"]')].filter(visible).map(element=>({url:element.href,text:element.innerText,headings:[...element.querySelectorAll('h1,h2,h3,h4,h5')].map(heading=>heading.innerText.trim())}))};
+}
+
+// Only the reservation form's single explicitly labelled full-name input may
+// receive the attempt's supplied contact. No profile page or saved account is edited.
+export async function fillReservationName(page,snapshot,fullName) {
+  if(typeof fullName!=='string' || !fullName.trim() || fullName.length>100 || /[\x00-\x1f\x7f]/.test(fullName))return 'blocked';
+  if(officialReservationRoute(snapshot?.url)?.kind!=='form')return 'blocked';
+  if(!snapshot.nameFields?.length)return 'absent';
+  if(snapshot.nameFields.length!==1)return 'blocked';
+  const field=snapshot.nameFields[0];
+  if(!Number.isSafeInteger(field.index) || field.index<0)return 'blocked';
+  try {
+    const locator=page.locator('input:visible').nth(field.index);
+    if(await locator.count()!==1 || !await locator.isVisible())return 'blocked';
+    if(await locator.inputValue()===fullName.trim())return 'ready';
+    if(field.readOnly || field.disabled || !await locator.isEditable())return 'blocked';
+    await locator.fill(fullName.trim());
+    return await locator.inputValue()===fullName.trim()?'filled':'blocked';
+  }catch{return 'blocked';}
 }

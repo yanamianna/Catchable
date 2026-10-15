@@ -4,7 +4,10 @@ import { resolve, extname, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Store } from './store.mjs';
 import { Engine } from './engine.mjs';
-import { ExtensionBridge } from './extension-bridge.mjs';
+import { ExtensionBroker } from './extension-bridge.mjs';
+import { AccountCoordinator } from './accounts.mjs';
+import { accountApi } from './account-api.mjs';
+import { backupBeforeAccounts } from './upgrade.mjs';
 import { HttpError, TASK_LIMIT, createTask, resolvePollInterval, safeMessage, validateBookingContactSettings, validateWebhookUrl } from './domain.mjs';
 
 const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml', '.woff2': 'font/woff2', '.ico': 'image/x-icon' };
@@ -28,7 +31,7 @@ async function readJson(request) {
   } catch { throw new HttpError(400, '请求内容须为 JSON 对象。'); }
 }
 
-export function createHttpServer({ store, engine, extensionBridge, frontendDir = resolve('dist'), port = 4174 }) {
+export function createHttpServer({ store, engine, extensionBridge, coordinator, frontendDir = resolve('dist'), port = 4174 }) {
   const server = createServer(async (request, response) => {
     try {
       const actualPort = server.address()?.port || port;
@@ -44,6 +47,10 @@ export function createHttpServer({ store, engine, extensionBridge, frontendDir =
           if (!/^application\/json(?:\s*;|$)/i.test(request.headers['content-type'] || '')) throw new HttpError(415, '操作请求须使用 application/json。');
         }
         const body = method === 'GET' ? {} : await readJson(request);
+        if(coordinator) {
+          const result=await accountApi({coordinator,url,method,body,request,port:actualPort});
+          if(result)return sendJson(response,result.status || 200,result.value);
+        }
         if (method === 'GET' && url.pathname === '/api/extension/pairing') {
           const origins = new Set([`http://127.0.0.1:${actualPort}`, `http://localhost:${actualPort}`, 'http://127.0.0.1:4173', 'http://localhost:4173']);
           const site = request.headers['sec-fetch-site'];
@@ -143,27 +150,23 @@ export function createHttpServer({ store, engine, extensionBridge, frontendDir =
 }
 
 export async function startServer({ dataDir = resolve(process.env.DATA_DIR || '.local-data'), port = Number(process.env.PORT || 4174), adapter, extensionBridge, frontendDir } = {}) {
-  if (!adapter) {
-    extensionBridge ||= new ExtensionBridge({dataDir,port});
-    await extensionBridge.init();
-    const { CatchtableAdapter } = await import('./catchtable.mjs');
-    adapter = new CatchtableAdapter({ dataDir, extensionBridge });
-  } else if (extensionBridge) {
-    await extensionBridge.init();
-  }
+  await backupBeforeAccounts(dataDir);
   const store = new Store(resolve(dataDir, 'catchtable.sqlite'));
-  const engine = new Engine({ store, adapter });
-  const server = createHttpServer({ store, engine, extensionBridge, frontendDir, port });
+  extensionBridge ||= new ExtensionBroker({dataDir,port});
+  await extensionBridge.init();
+  const coordinator=await new AccountCoordinator({store,broker:extensionBridge,dataDir,...(adapter?{adapterFactory:()=>adapter}:{})}).init();
+  const engine=coordinator.engine();
+  const server = createHttpServer({ store, engine, extensionBridge, coordinator, frontendDir, port });
   await new Promise((resolveStarted, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', resolveStarted); });
-  engine.start();
+  coordinator.start();
   const close = async () => {
     // WebSocket clients otherwise keep HTTP close waiting indefinitely.
     await extensionBridge?.close();
     await new Promise((resolveClosed) => server.close(resolveClosed));
-    await engine.stop();
+    await coordinator.stop();
     store.close();
   };
-  return { server, store, engine, extensionBridge, close };
+  return { server, store, engine, extensionBridge, coordinator, close };
 }
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {

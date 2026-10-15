@@ -3,7 +3,7 @@ chcp 65001 >nul
 cd /d "%~dp0"
 where node >nul 2>nul
 if errorlevel 1 (
-  echo Please install Node.js 22.13 or newer first.
+  echo Please install Node.js 22.16 or newer first.
   pause
   exit /b 1
 )

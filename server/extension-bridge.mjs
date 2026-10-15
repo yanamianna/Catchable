@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 
 const PAIRING_PATTERN = /^[A-Za-z0-9_-]{24,128}$/;
+const ACCOUNT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/;
 const ROOT_TARGET_METHODS = new Set(['Target.getTargets','Target.getTargetInfo','Target.getBrowserContexts','Target.setDiscoverTargets','Target.setAutoAttach','Target.attachToTarget','Target.detachFromTarget','Target.createTarget','Target.closeTarget','Target.activateTarget']);
 const PAGE_DOMAINS = new Set(['Page','Runtime','DOM','CSS','Network','Log','Inspector','Emulation','Input','Accessibility','Target']);
 const FORBIDDEN_METHODS = /^(?:Storage\.|DOMStorage\.|IndexedDB\.|CacheStorage\.|Network\.(?:getAllCookies|getCookies|setCookie|setCookies|deleteCookies|clearBrowserCookies|getRequestPostData)|Browser\.(?:close|getBrowserCommandLine|grantPermissions|resetPermissions)|Target\.(?:createBrowserContext|disposeBrowserContext))/;
@@ -82,6 +83,7 @@ export class ExtensionBridge {
   #cdpServer;
   #initialized = false;
   #lastIssue = null;
+  #label = null;
 
   constructor({ dataDir = resolve('.local-data'), extensionPath = resolve('extension'), port = 4174, pairingCode, commandTimeoutMs = 15000, handshakeTimeoutMs = 5000 } = {}) {
     this.dataDir = resolve(dataDir); this.extensionPath = resolve(extensionPath); this.port = port;
@@ -128,13 +130,27 @@ export class ExtensionBridge {
     return { pairingCode: this.#pairingCode, extensionPath: this.extensionPath };
   }
 
+  setLabel(label) {
+    if (typeof label !== 'string' || !label.trim() || label.length > 100) throw new Error('账号名称格式不正确。');
+    this.#label = label.trim();
+    if (this.#hello && this.#extension?.readyState === WebSocket.OPEN) this.#extension.send(JSON.stringify({ type: 'hello_ack', accountLabel: this.#label }));
+    return this;
+  }
+
+  matchesPairing(protocol) { return this.#initialized && equalSecret(protocol, `pair.${this.#pairingCode}`); }
+  matchesCdpPath(path) { return equalSecret(path, `/cdp/${this.#cdpToken}`); }
+  handleUpgrade(request, socket, head) {
+    if (!this.#upgrade) throw new Error('扩展桥尚未绑定本地服务。');
+    return this.#upgrade(request, socket, head);
+  }
+
   getCdpEndpoint() {
     if (!this.state().connected) throw bridgeError('Chrome 扩展尚未连接，请先完成扩展配对。', 'EXTENSION_NOT_CONNECTED');
     const port = this.#server?.address()?.port || this.port;
     return `ws://127.0.0.1:${port}/cdp/${this.#cdpToken}`;
   }
 
-  attach(server) {
+  attach(server, { listen = true } = {}) {
     if (!this.#initialized) throw new Error('请先初始化扩展桥。');
     if (this.#server) throw new Error('扩展桥已经绑定本地服务。');
     this.#server = server;
@@ -170,8 +186,10 @@ export class ExtensionBridge {
       }
       return reject();
     };
-    server.on('upgrade', this.#upgrade);
-    server.once('close', () => { void this.close(); });
+    if (listen) {
+      server.on('upgrade', this.#upgrade);
+      server.once('close', () => { void this.close(); });
+    }
     return this;
   }
 
@@ -197,6 +215,7 @@ export class ExtensionBridge {
           return invalidHello('Invalid extension handshake');
         this.#hello = { userAgent: message.userAgent, protocolVersion: '1.3' };
         this.#lastIssue = null;
+        if (this.#label !== null) socket.send(JSON.stringify({ type: 'hello_ack', accountLabel: this.#label }));
         clearTimeout(timer); return;
       }
       if (message.type === 'result') {
@@ -375,12 +394,80 @@ export class ExtensionBridge {
   async close() {
     if (this.#closed) return;
     this.#closed = true;
-    this.#server?.off('upgrade', this.#upgrade);
+    if (this.#upgrade) this.#server?.off('upgrade', this.#upgrade);
     this.#rejectPending(bridgeError('本地扩展桥已停止；未完成命令不会重发。', 'EXTENSION_DISCONNECTED'));
     for (const client of this.#cdpClients) client.terminate();
     this.#extension?.terminate();
     this.#cdpClients.clear(); this.#extension = null; this.#hello = null;
     this.#targets.clear(); this.#sessions.clear(); this.#responses.clear(); this.#mainFrames.clear();
     await Promise.all([this.#workerServer, this.#cdpServer].filter(Boolean).map(server => new Promise(done => server.close(() => done()))));
+  }
+}
+
+// One local upgrade listener routes a pairing or private CDP token to exactly
+// one bridge. Target/session/request maps remain private to that account.
+export class ExtensionBroker {
+  #bridges = new Map();
+  #creating = new Map();
+  #server = null;
+  #upgrade = null;
+  #closed = false;
+
+  constructor({ dataDir = resolve('.local-data'), port = 4174, extensionPath = resolve('extension'), ...options } = {}) {
+    this.dataDir = resolve(dataDir); this.port = port; this.extensionPath = resolve(extensionPath); this.options = options;
+  }
+
+  async init() { await this.ensureAccount('default'); return this; }
+
+  async ensureAccount(accountId = 'default') {
+    if (this.#closed) throw new Error('本地扩展服务已停止。');
+    if (typeof accountId !== 'string' || !ACCOUNT_PATTERN.test(accountId)) throw new Error('账号标识格式不正确。');
+    if (this.#bridges.has(accountId)) return this.#bridges.get(accountId);
+    if (this.#creating.has(accountId)) return this.#creating.get(accountId);
+    const promise = (async () => {
+      const bridge = new ExtensionBridge({ ...this.options, dataDir: accountId === 'default' ? this.dataDir : join(this.dataDir, 'accounts', accountId), port: this.port, extensionPath: this.extensionPath });
+      await bridge.init();
+      if (this.#closed) { await bridge.close(); throw new Error('本地扩展服务已停止。'); }
+      if([...this.#bridges.values()].some(existing=>existing.matchesPairing(`pair.${bridge.pairingInfo().pairingCode}`)))throw new Error('账号扩展配对设置重复，暂未启用此账号连接。');
+      bridge.setLabel(accountId === 'default' ? '默认账号' : accountId);
+      if (this.#server) bridge.attach(this.#server, { listen: false });
+      this.#bridges.set(accountId, bridge);
+      return bridge;
+    })();
+    this.#creating.set(accountId, promise);
+    try { return await promise; } finally { this.#creating.delete(accountId); }
+  }
+
+  getBridge(accountId = 'default') {
+    const bridge = this.#bridges.get(accountId);
+    if (!bridge) throw new Error('账号尚未初始化。');
+    return bridge;
+  }
+
+  state(accountId = 'default') { return this.getBridge(accountId).state(); }
+  pairingInfo(accountId = 'default') { return this.getBridge(accountId).pairingInfo(); }
+
+  attach(server) {
+    if (this.#closed || this.#server) throw new Error('本地扩展服务已停止或已绑定。');
+    this.#server = server;
+    for (const bridge of this.#bridges.values()) bridge.attach(server, { listen: false });
+    this.#upgrade = (request, socket, head) => {
+      const protocols = String(request.headers['sec-websocket-protocol'] || '').split(',').map(value => value.trim());
+      let matched;
+      if (request.url === '/extension') matched = [...this.#bridges.values()].find(bridge => bridge.matchesPairing(protocols[1]));
+      else if (typeof request.url === 'string' && request.url.startsWith('/cdp/')) matched = [...this.#bridges.values()].find(bridge => bridge.matchesCdpPath(request.url));
+      if (matched) return matched.handleUpgrade(request, socket, head);
+      socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); socket.destroy();
+    };
+    server.on('upgrade', this.#upgrade);
+    server.once('close', () => { void this.close(); });
+    return this;
+  }
+
+  async close() {
+    if (this.#closed) return;
+    this.#closed = true;
+    if (this.#upgrade) this.#server?.off('upgrade', this.#upgrade);
+    await Promise.all([...this.#bridges.values()].map(bridge => bridge.close()));
   }
 }

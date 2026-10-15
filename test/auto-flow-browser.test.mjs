@@ -46,6 +46,7 @@ function shopHtml() {
 }
 function formHtml() {
   return `<!doctype html><html><head><meta charset="utf-8">${css}</head><body><main><h2>${task.restaurantName}</h2><p>10.13 (Tue) · 13:00 · 2人</p><p>Total: ₩0</p><label>预约人<input required value="Offline Fixture" /></label><section><h3>电话号码<span>*必填</span></h3><div><div id="country"><span>+1</span></div><input type="tel" /></div></section><div id="countries"></div><button id="checkout" disabled>Checkout</button></main><script>
+    document.querySelector('label input').oninput=async()=>{await window.fixtureTrack('name-filled')};
     const phone=document.querySelector('input[type="tel"]');
     const country=document.querySelector('#country');
     country.onclick=async()=>{
@@ -118,7 +119,8 @@ test('offline browser completes calendar filter, visible-text shop slot, nested 
     }
     external.push(request.url()); return route.abort('blockedbyclient');
   });
-  const adapter = new CatchtableAdapter(); adapter.context = context;
+  const identities=new Set();let identityChecks=0;
+  const adapter = new CatchtableAdapter({identityVerifier:async fingerprint=>{assert.match(fingerprint,/^[a-f0-9]{64}$/);identities.add(fingerprint);identityChecks++;assert.equal(identities.size,1);}}); adapter.context = context;
   const onBeforeSubmit=async()=>{trace.push('persist');persistCount+=1;persisted=true;};
   const initial=await adapter.prepare(task,slot,{onBeforeSubmit});
   assert.equal(initial.status,'user_action_required');assert.equal(initial.phase,'required_fields');
@@ -126,11 +128,13 @@ test('offline browser completes calendar filter, visible-text shop slot, nested 
   assert.equal(createCount,0);assert.equal(persistCount,0,'an empty mandatory phone must not reach the write boundary');
   assert.equal(simulatedLostClickAcknowledgement,true,'an already opened next step must survive a lost slot-click acknowledgement');
   const result = await adapter.continueAttempt({id:'offline-attempt',taskSnapshot:task,slot,status:initial.status,phase:initial.phase,submitted:false},
-    {onBeforeSubmit,bookingContact:{countryCode:'+86',phoneNumber:'13800000000'}});
+    {onBeforeSubmit,bookingContact:{countryCode:'+86',phoneNumber:'13800000000',fullName:'Offline Authorized Guest'}});
   assert.equal(result.status, 'pending_restaurant', JSON.stringify({ result, trace, pageErrors }));
   assert.equal(result.reservationId, id);
   assert.equal(persistCount, 1); assert.equal(createCount, 1);
-  for (const event of ['calendar-filter-slot', 'main-slot-open', 'promo-later', 'same-day-next', 'notice-request', 'country-open', 'country-select', 'phone-filled', 'checkout-click']) assert.equal(trace.filter(value => value === event).length, 1, event);
+  for (const event of ['calendar-filter-slot', 'main-slot-open', 'promo-later', 'same-day-next', 'notice-request', 'name-filled', 'country-open', 'country-select', 'phone-filled', 'checkout-click']) assert.equal(trace.filter(value => value === event).length, 1, event);
+  assert.ok(identityChecks>=3,'booking form and independent official order pages each validate the bound account identity');
+  assert.ok(!JSON.stringify(result).includes('Offline Authorized Guest'));
   assert.equal(trace.filter(value => value === 'promo-close' || value === 'promo-app').length, 0, 'only the scoped Later button may dismiss the promo');
   assert.ok(trace.indexOf('calendar-filter-slot') < trace.indexOf('main-slot-open'));
   assert.ok(trace.indexOf('main-slot-open') < trace.indexOf('notice-request'));

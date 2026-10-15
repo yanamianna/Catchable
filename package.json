@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Local Catchtable Global reservation monitor and booking assistant",
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.16.0"
   },
   "scripts": {
     "dev": "node scripts/dev.mjs",
