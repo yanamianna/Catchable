@@ -6,7 +6,7 @@ import { ACCOUNT_SETTING_KEYS, ACTIVE_TASK_STATUSES, DEFAULT_ACCOUNT_ID, HttpErr
 export { DEFAULT_ACCOUNT_ID } from './domain.mjs';
 
 const read = (row) => row ? JSON.parse(row.payload) : null;
-export const publicAccount = account => account ? { id: account.id, label: account.label, enabled: account.enabled, settings: structuredClone(account.settings) } : null;
+export const publicAccount = account => account ? { id: account.id, label: account.label, enabled: account.enabled, settings: structuredClone(account.settings), ...(account.deletedAt ? { deletedAt: account.deletedAt } : {}) } : null;
 const contactSnapshot = settings => ({ name: settings.bookingName || '', countryCode: settings.bookingPhoneCountryCode || '', phoneNumber: settings.bookingPhoneNumber || '', autoFill: settings.bookingPhoneAutoFill === true });
 
 export class Store {
@@ -77,9 +77,9 @@ export class Store {
   #accountsReady() {
     if (!this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'").get()) throw new HttpError(409, '请先初始化多账号存储。');
   }
-  listAccounts() {
+  listAccounts({ includeArchived = false } = {}) {
     this.#accountsReady();
-    return this.db.prepare('SELECT payload FROM accounts ORDER BY rowid').all().map(read).map(publicAccount);
+    return this.db.prepare(`SELECT payload FROM accounts ${includeArchived ? '' : "WHERE json_extract(payload,'$.deletedAt') IS NULL"} ORDER BY rowid`).all().map(read).map(publicAccount);
   }
   getAccount(id) {
     this.#accountsReady();
@@ -97,7 +97,7 @@ export class Store {
   }
   updateAccount(id, changes = {}) {
     const account = this.getAccount(id);
-    if (!account) throw new HttpError(404, '找不到该账号。');
+    if (!account || account.deletedAt) throw new HttpError(404, '找不到该账号。');
     if (!changes || typeof changes !== 'object' || Array.isArray(changes) || Object.keys(changes).some(key => !['label', 'enabled', 'settings'].includes(key))) throw new HttpError(400, '账号参数无效。');
     let label = account.label;
     if (Object.hasOwn(changes, 'label')) {
@@ -112,11 +112,46 @@ export class Store {
     if (typeof fingerprint !== 'string' || !fingerprint.trim() || fingerprint.length > 256 || /\s/.test(fingerprint)) throw new HttpError(400, '账号身份核验值无效。');
     return this.transaction(() => {
       const account = this.getAccount(id);
-      if (!account) throw new HttpError(404, '找不到该账号。');
+      if (!account || account.deletedAt) throw new HttpError(404, '找不到该账号。');
       if (account.identityFingerprint && account.identityFingerprint !== fingerprint) throw new HttpError(409, '该账号已绑定另一身份，请使用独立账号配置。');
       if (this.db.prepare('SELECT id FROM accounts WHERE identity_fingerprint=? AND id<>?').get(fingerprint, id)) throw new HttpError(409, '该官网账号已经绑定其他账号配置。');
       const updated = { ...account, identityFingerprint: fingerprint };
       this.db.prepare('UPDATE accounts SET payload=?,identity_fingerprint=? WHERE id=?').run(JSON.stringify(updated), fingerprint, id);
+      return updated;
+    });
+  }
+  #changeableAccount(id) {
+    const account = this.getAccount(id);
+    if (!account || account.deletedAt) throw new HttpError(404, '找不到该账号。');
+    if (this.forAccount(id).listPendingAttempts().length) throw new HttpError(409, '该账号有待核验或待餐厅确认的预约，请先处理后再更换登录账号或删除。');
+    return account;
+  }
+  resetAccountIdentity(id, now = isoNow()) {
+    return this.transaction(() => {
+      const account = this.#changeableAccount(id), scoped = this.forAccount(id);
+      for (const task of scoped.listTasks()) {
+        if (task.source !== 'live' || ['confirmed', 'expired'].includes(task.status)) continue;
+        scoped.patchTask(task.id, { status: 'paused', nextCheckAt: null, slots: [], lastObservationStatus: null, lastObservationComplete: false,
+          lastCheckedAt: null, lastCheckStartedAt: null, lastCheckDurationMs: null, effectiveIntervalMs: null, lastMessage: '已更换登录绑定，请核验新账号后手动启动任务。' }, now);
+      }
+      this.db.prepare('DELETE FROM slots WHERE account_id=?').run(id);
+      const updated = { ...account, enabled: true, identityFingerprint: null, settings: validateAccountSettings({ enginePaused: true, bookingName: '', bookingPhoneCountryCode: '', bookingPhoneNumber: '', bookingPhoneAutoFill: false }, account.settings) };
+      this.db.prepare('UPDATE accounts SET payload=?,identity_fingerprint=NULL WHERE id=?').run(JSON.stringify(updated), id);
+      return updated;
+    });
+  }
+  archiveAccount(id, now = isoNow()) {
+    if (id === DEFAULT_ACCOUNT_ID) throw new HttpError(409, '默认账号需要保留，可选择停用或更换登录账号。');
+    return this.transaction(() => {
+      const account = this.#changeableAccount(id), scoped = this.forAccount(id);
+      for (const task of scoped.listTasks()) if (!['confirmed', 'expired'].includes(task.status)) {
+        scoped.patchTask(task.id, { status: 'paused', nextCheckAt: null, lastMessage: '账号已删除，任务停止运行。' }, now);
+      }
+      for (const notice of this.db.prepare("SELECT payload FROM notifications WHERE account_id=? AND status='queued'").all(id).map(read)) {
+        scoped.saveNotification({ ...notice, status: 'failed', nextAttemptAt: null, updatedAt: now, lastError: '账号已删除，停止投递。' });
+      }
+      const updated = { ...account, enabled: false, deletedAt: now, identityFingerprint: null, settings: { ...account.settings, enginePaused: true } };
+      this.db.prepare('UPDATE accounts SET payload=?,identity_fingerprint=NULL WHERE id=?').run(JSON.stringify(updated), id);
       return updated;
     });
   }

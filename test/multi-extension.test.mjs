@@ -111,6 +111,28 @@ test('short codes are plaintext, stable across restarts and preserve every exist
   assert.equal(restarted.pairingInfo().pairingCode,legacy);
 });
 
+test('removing an account revokes only its connection and rejects retired pairing codes',async t=>{
+  const dataDir=await scratch(t);
+  const broker=await new ExtensionBroker({dataDir,port:0}).init();
+  await broker.ensureAccount('removed-profile');
+  const server=createServer();broker.attach(server);await new Promise(done=>server.listen(0,'127.0.0.1',done));
+  const sockets=[];t.after(async()=>{for(const socket of sockets)socket.terminate();await broker.close();await new Promise(done=>server.close(done));});
+  const url=`ws://127.0.0.1:${server.address().port}/extension`;
+  const retiredCode=broker.simplePairingInfo('removed-profile').pairingCode;
+  for(const id of ['default','removed-profile']) {
+    const socket=await connect(url,broker.simplePairingInfo(id).pairingCode);sockets.push(socket);socket.send(JSON.stringify(hello));
+    await until(()=>broker.state(id).connected);
+  }
+  const closed=new Promise(done=>sockets[1].once('close',code=>done(code)));
+  await broker.removeAccount('removed-profile');
+  assert.equal(await closed,1008,'the worker must stop reconnecting a deleted account');
+  assert.equal(broker.state('default').connected,true);
+  assert.equal(await refused(url,retiredCode),403);
+  await assert.rejects(broker.ensureAccount('removed-profile'),/已删除/);
+  await assert.rejects(broker.removeAccount('default'),/默认账号/);
+  assert.equal(server.listenerCount('upgrade'),1);
+});
+
 test('short and legacy credentials route to one account and keep duplicate-connection protection',async t=>{
   const dataDir=await scratch(t);
   const broker=await new ExtensionBroker({dataDir,port:0}).init();
@@ -189,7 +211,7 @@ class NavigatingAuthPage extends AuthPage {
     this.address=url;
     const request={method:()=> 'GET',url:()=>infoUrl,isNavigationRequest:()=>false,frame:()=>this.frame};
     this.emit('request',request);
-    this.emit('response',{url:()=>infoUrl,status:()=>200,request:()=>request,json:async()=>({isLogin:true,ctUserIdentifier:this.identity,displayName:'Synthetic'}),finished:async()=>null});
+    this.emit('response',{url:()=>infoUrl,status:()=>200,request:()=>request,json:async()=>({isLogin:true,ctUserIdentifier:typeof this.identity==='function'?this.identity():this.identity,displayName:'Synthetic'}),finished:async()=>null});
     if(this.scheduled!==undefined)this.emit('response',{url:()=> 'https://api.catchtable.net/api/v6/my-dining/scheduled?page=0&size=10',status:()=>200,request:()=>({method:()=> 'GET'}),json:async()=>this.scheduled,finished:async()=>null});
   }
   evaluate(){return Promise.resolve({url:this.address,text:'Synthetic account',loading:false,accountEvidence:{kind:'profile',label:'Stale UI'},cards:[],headings:[],buttons:[],summaries:[],links:[],dialogs:[]});}
@@ -241,8 +263,8 @@ test('a complete matching order response remains unknown when that order page ha
   const task={id:'synthetic-order-task',restaurantName:'Synthetic Restaurant',restaurantUrl:'https://www.catchtable.net/shop/synthetic',dates:['2030-01-02'],partySize:2,timeStart:'13:00',timeEnd:'13:00',mode:'auto',autoConsent:true};
   const slot={date:'2030-01-02',time:'13:00',partySize:2};
   const scheduled={hasNext:false,list:[{reservationType:'DINING',reservationInfo:{reservationRef:'synthetic-order-001',visitDateTime:'2030-01-02T13:00:00+09:00',totalPersonCount:2,isConfirmationPending:false},localizedShopPreview:{alias:'synthetic',shopRef:'synthetic-shop',shopName:task.restaurantName}}]};
-  let orderIdentity='synthetic-owner';const pages=[primary];
-  adapter.context={on:()=>{},pages:()=>pages,newPage:async()=>{const page=new NavigatingAuthPage(orderIdentity,{scheduled});pages.push(page);return page;}};
+  let orderIdentity='synthetic-owner',identityReads=0;const pages=[primary];
+  adapter.context={on:()=>{},pages:()=>pages,newPage:async()=>{const page=new NavigatingAuthPage(()=>{identityReads++;return orderIdentity;},{scheduled});pages.push(page);return page;}};
   await adapter.observeSession();await primary.info(adapter,{isLogin:true,ctUserIdentifier:'synthetic-owner',displayName:'Synthetic'});
   const attempt={id:'synthetic-attempt',task,slot,status:'pending_restaurant',submitted:true};
   assert.equal((await adapter.reconcile(attempt)).status,'confirmed');
@@ -250,4 +272,6 @@ test('a complete matching order response remains unknown when that order page ha
   const result=await adapter.reconcile(attempt);
   assert.equal(result.status,'outcome_unknown');assert.equal(result.reservationId,undefined);
   assert.equal((await adapter.observeSession()).status,'identity_mismatch');
+  assert.equal(pages.length,2,'the same order helper is reused instead of replacing the identity check');
+  assert.equal(identityReads,2,'each order-page navigation receives the current profile identity');
 });

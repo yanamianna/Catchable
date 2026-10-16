@@ -16,6 +16,8 @@
 .account-statuses { display:flex; flex-wrap:wrap; gap:8px 12px; justify-content:flex-end; }
 .account-card-actions { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:16px; }
 .account-card-actions .text-button { font-size:12px; }
+.account-card-actions .account-delete-action { color:#b95b48; margin-left:auto; }
+.account-lifecycle-note { color:var(--muted); font-size:12px; line-height:1.9; margin:12px 0; }
 .account-details { margin-top:12px; font-size:12px; color:var(--muted); }
 .account-details > summary { cursor:pointer; padding-block:12px; min-height:44px; }
 .account-id { font-size:11px; overflow-wrap:anywhere; margin:6px 0 12px; }

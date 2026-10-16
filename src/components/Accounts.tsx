@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import type { Account, AccountFormValues } from '../types';
 import { Icon } from './Icon';
@@ -9,8 +9,9 @@ import './accounts.css';
 
 export function accountAuthenticated(account: Account) {
   return (account.settings.browserIntegration !== 'extension' || account.extension?.connected === true)
-    && (account.session.status === 'authenticated' || account.session.authenticated === true);
+    && (account.session.status ? account.session.status === 'authenticated' : account.session.authenticated === true);
 }
+export type AccountLifecycleAction = 'reset_identity' | 'delete';
 function maskedPhone(account: Account) {
   const phone = account.settings.bookingPhoneNumber;
   return phone ? `尾号 ${phone.slice(-4)}` : '未设置电话';
@@ -44,9 +45,12 @@ function AccountEditor({ account, busy, onClose, onSave }: { account: Account | 
 type AccountFilter = 'all' | 'ready' | 'login' | 'disconnected' | 'paused' | 'disabled';
 const filters: Array<{ id: AccountFilter; label: string }> = [{ id: 'all', label: '全部状态' }, { id: 'ready', label: '可调度' }, { id: 'login', label: '待核验登录' }, { id: 'disconnected', label: '未连接' }, { id: 'paused', label: '已暂停' }, { id: 'disabled', label: '已停用' }];
 
-export function Accounts({ accounts, pending, globalPaused, selectedAccountId, onSave, onToggle, onEngine, onSession }: { accounts: Account[]; pending: ReadonlySet<string>; globalPaused: boolean; selectedAccountId: string; onSave: (values: AccountFormValues, accountId?: string) => Promise<void>; onToggle: (account: Account) => void; onEngine: (accountId: string) => void; onSession: (accountId: string, action: 'open' | 'check', mode?: LoginMode) => Promise<void> | void }) {
+export function Accounts({ accounts, pending, globalPaused, selectedAccountId, onSave, onToggle, onEngine, onSession, onLifecycle }: { accounts: Account[]; pending: ReadonlySet<string>; globalPaused: boolean; selectedAccountId: string; onSave: (values: AccountFormValues, accountId?: string) => Promise<void>; onToggle: (account: Account) => void; onEngine: (accountId: string) => void; onSession: (accountId: string, action: 'open' | 'check', mode?: LoginMode) => Promise<void> | void; onLifecycle: (account: Account, action: AccountLifecycleAction) => Promise<void> }) {
   const [search, setSearch] = useState(''); const [filter, setFilter] = useState<AccountFilter>('all'); const [page, setPage] = useState(1);
   const [editor, setEditor] = useState<Account | 'new' | null>(null);
+  const [lifecycle, setLifecycle] = useState<{ account: Account; action: AccountLifecycleAction } | null>(null);
+  const [lifecycleError, setLifecycleError] = useState('');
+  const lifecycleLock = useRef(false);
   useEffect(() => { if (selectedAccountId !== 'all') { setSearch(''); setFilter('all'); const index = accounts.findIndex(account => account.id === selectedAccountId); if (index >= 0) setPage(Math.floor(index / 20) + 1); } }, [selectedAccountId]);
   const visible = accounts.filter(account => {
     if (!`${account.label} ${account.id}`.toLowerCase().includes(search.trim().toLowerCase())) return false;
@@ -55,6 +59,15 @@ export function Accounts({ accounts, pending, globalPaused, selectedAccountId, o
   });
   const pages = Math.max(1, Math.ceil(visible.length / 20)); const currentPage = Math.min(page, pages); const rows = visible.slice((currentPage - 1) * 20, currentPage * 20);
   function updateSearch(value: string) { setSearch(value); setPage(1); }
+  function openLifecycle(account: Account, action: AccountLifecycleAction) { setLifecycleError(''); setLifecycle({ account, action }); }
+  async function confirmLifecycle() {
+    if (!lifecycle || lifecycleLock.current) return;
+    lifecycleLock.current = true; setLifecycleError('');
+    try { await onLifecycle(lifecycle.account, lifecycle.action); setLifecycle(null); }
+    catch (cause) { setLifecycleError(cause instanceof Error ? cause.message : '操作失败，请重试。'); }
+    finally { lifecycleLock.current = false; }
+  }
+  const lifecycleBusy = !!lifecycle && pending.has(`account:${lifecycle.account.id}`);
   return <section className="accounts-section"><div className="records-heading"><div className="section-intro"><span className="eyebrow">ACCOUNTS</span><h2>账号管理</h2><p>{accounts.length} 个账号 · 每个账号最多 5 个任务</p></div><button type="button" className="button primary" onClick={() => setEditor('new')} disabled={pending.has('account:new')}><Icon name="plus" size={17} />添加账号</button></div>
     <div className="accounts-toolbar"><label className="search-field"><Icon name="search" size={17} /><input aria-label="搜索账号" value={search} onInput={event => updateSearch(event.currentTarget.value)} onChange={event => updateSearch(event.target.value)} placeholder="搜索账号名称或 ID" /></label><label className="account-filter">状态<select aria-label="账号状态筛选" value={filter} onChange={event => { setFilter(event.target.value as AccountFilter); setPage(1); }}>{filters.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label></div>
     {globalPaused ? <p className="accounts-global-note">全局调度已暂停。单个账号恢复不会解除全局暂停。</p> : null}
@@ -63,10 +76,15 @@ export function Accounts({ accounts, pending, globalPaused, selectedAccountId, o
       const sessionBusy = pending.has(`session:${account.id}`); const engineBusy = pending.has(`engine:${account.id}`); const accountBusy = pending.has(`account:${account.id}`);
       return <article className="account-card" key={account.id}><div className="account-card-top"><div className="account-card-title"><h3>{account.label}</h3><p>{maskedPhone(account)} · {account.taskCount ?? '—'}/5 任务</p></div><div className="account-statuses"><span className={`status ${!account.enabled || account.engine.paused ? 'status-paused' : 'status-confirmed'}`}><span />{!account.enabled ? '已停用' : globalPaused ? '全局暂停' : account.settings.enginePaused ? '账号暂停' : '已启用'}</span><span className={`status ${authenticated ? 'status-confirmed' : 'status-auth_required'}`}><span />{authenticated ? '登录已核验' : connected ? '待核验登录' : '未连接'}</span></div></div>
         <SessionPanel accountId={account.id} bindingLabel={account.label} state={{ settings: account.settings, session: account.session, extension: account.extension }} embedded busy={sessionBusy} onSession={(action, mode) => onSession(account.id, action, mode)} />
-        <div className="account-card-actions"><button type="button" className="button small" disabled={engineBusy || !account.enabled} onClick={() => onEngine(account.id)}>{engineBusy ? '处理中…' : account.settings.enginePaused ? '恢复账号' : '暂停账号'}</button><button type="button" className="button small" disabled={accountBusy} onClick={() => setEditor(account)}>编辑</button><button type="button" className="text-button" disabled={accountBusy} onClick={() => onToggle(account)}>{accountBusy ? '处理中…' : account.enabled ? '停用' : '启用'}</button></div>
+        <div className="account-card-actions"><button type="button" className="button small" disabled={engineBusy || accountBusy || !account.enabled} onClick={() => onEngine(account.id)}>{engineBusy ? '处理中…' : account.settings.enginePaused ? '恢复账号' : '暂停账号'}</button><button type="button" className="button small" disabled={accountBusy} onClick={() => setEditor(account)}>编辑</button><button type="button" className="button small" disabled={accountBusy || sessionBusy || engineBusy} onClick={() => openLifecycle(account, 'reset_identity')}>更换登录账号</button><button type="button" className="text-button" disabled={accountBusy} onClick={() => onToggle(account)}>{accountBusy ? '处理中…' : account.enabled ? '停用' : '启用'}</button><button type="button" className="text-button account-delete-action" disabled={account.id === 'default' || accountBusy || sessionBusy || engineBusy} title={account.id === 'default' ? '默认账号可更换登录或停用' : '删除账号，保留历史预约记录'} onClick={() => openLifecycle(account, 'delete')}>删除账号</button></div>
       </article>;
     })}</div> : <div className="empty-state compact"><Icon name="link" size={30} /><h3>{accounts.length ? '没有符合条件的账号' : '先添加一个账号'}</h3>{accounts.length ? <button type="button" className="button" onClick={() => { setSearch(''); setFilter('all'); setPage(1); }}>查看全部账号</button> : null}</div>}
     <div className="account-pagination"><span aria-live="polite">{visible.length} 个匹配 · 第 {currentPage}/{pages} 页 · 20/页</span><div><button type="button" className="button small" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}>上一页</button><button type="button" className="button small" disabled={currentPage >= pages} onClick={() => setPage(currentPage + 1)}>下一页</button></div></div>
     {editor ? <AccountEditor key={editor === 'new' ? 'new' : editor.id} account={editor === 'new' ? null : editor} busy={pending.has(editor === 'new' ? 'account:new' : `account:${editor.id}`)} onClose={() => setEditor(null)} onSave={onSave} /> : null}
+    {lifecycle ? <Modal title={`${lifecycle.action === 'delete' ? '删除账号' : '更换登录账号'} · ${lifecycle.account.label}`} onClose={() => setLifecycle(null)} busy={lifecycleBusy}>
+      {lifecycle.action === 'delete' ? <><p className="modal-subtitle">将「{lifecycle.account.label}」从管理列表移除，并停止其任务。历史预约记录保留在本机。</p><p className="account-lifecycle-note">有待核验预约时无法删除，请先处理预约结果。</p></> : <><p className="modal-subtitle">请先在此账号对应的 Chrome 用户资料中登录新的 Catchtable 账号。</p><p className="account-lifecycle-note">此操作会暂停该账号全部任务，清空原身份绑定及姓名、电话预填。历史预约记录保留。</p><p className="account-lifecycle-note">更换后需核验新登录，再填写预约资料、恢复任务。</p></>}
+      {lifecycleError ? <p className="form-error" role="alert">{lifecycleError}</p> : null}
+      <div className="modal-footer"><button type="button" className="button" disabled={lifecycleBusy} onClick={() => setLifecycle(null)}>取消</button><button type="button" className="button primary" disabled={lifecycleBusy} onClick={() => void confirmLifecycle()}>{lifecycleBusy ? '正在处理…' : lifecycle.action === 'delete' ? '确认删除账号' : '确认更换账号'}</button></div>
+    </Modal> : null}
   </section>;
 }

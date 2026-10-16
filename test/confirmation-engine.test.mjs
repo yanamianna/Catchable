@@ -151,6 +151,30 @@ test('continue submission callback refuses a paused task and other uncertain acc
   } finally {await f.close();}
 });
 
+test('off-selection slots are rejected before a new attempt is persisted',async()=>{
+  const f=fixture();
+  try {
+    const task=f.task({timeSlots:['12:00','14:00']});
+    await assert.rejects(f.engine.prepareTask(task,slot),/选定.*时间/);
+    assert.equal(f.store.listAttempts().length,0);assert.equal(f.calls.prepare,0);
+  }finally {await f.close();}
+});
+
+test('final submit enforces both the current selection and immutable original attempt selection',async()=>{
+  for(const originalTimes of [['13:00'],['14:00']]) {
+    const f=fixture({hasContext:true});
+    try {
+      f.engine.applySession({status:'authenticated',connected:true,browserOpen:true});
+      const task=f.task({timeSlots:originalTimes});
+      const attempt=f.store.addAttempt(task,slot,'user_action_required');
+      const currentTimes=originalTimes[0]==='13:00'?['14:00']:['13:00','14:00'];
+      f.store.patchTask(task.id,{timeSlots:currentTimes});
+      await assert.rejects(f.engine.beforeSubmit(attempt)(),/原预约条件不一致/);
+      assert.equal(f.store.getAttempt(attempt.id).submitted,false);
+    }finally {await f.close();}
+  }
+});
+
 test('restart keeps submitted unknown attempts locked and schedules only read-only verification',async()=>{
   const dir=mkdtempSync(join(tmpdir(),'catchable-confirmation-'));const path=join(dir,'state.sqlite');let store=new Store(path,{now:()=>NOW});let engine;
   try {

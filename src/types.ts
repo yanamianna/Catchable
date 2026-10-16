@@ -12,7 +12,7 @@ export interface VerificationProgress {
 }
 export interface Task extends VerificationProgress {
   id: string; accountId: string; accountLabel?: string; restaurantName: string; restaurantUrl: string; dates: string[];
-  partySize: number; timeStart: string; timeEnd: string; mode: Mode; groupId?: string;
+  partySize: number; timeStart: string; timeEnd: string; timeSlots?: string[]; mode: Mode; groupId?: string;
   pollIntervalMs: number; status: TaskStatus; source: Source;
   createdAt: string; updatedAt: string; checkCount: number; lastCheckedAt?: string;
   lastCheckStartedAt?: string | null; lastCheckDurationMs?: number | null; effectiveIntervalMs?: number | null;
@@ -70,6 +70,6 @@ export interface AppState {
 }
 export interface NewTask {
   accountId: string; restaurantName: string; restaurantUrl: string; dates: string[]; partySize: number;
-  timeStart: string; timeEnd: string; mode: Mode; groupId?: string;
+  timeStart: string; timeEnd: string; timeSlots: string[]; mode: Mode; groupId?: string;
   pollIntervalMs: number; autoConsent?: boolean;
 }

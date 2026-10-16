@@ -9,6 +9,8 @@ export class HttpError extends Error {
 export const isoNow = () => new Date().toISOString();
 export const identifier = (prefix) => `${prefix}_${randomUUID()}`;
 export const TASK_LIMIT = 5;
+const TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+const HALF_HOUR_PATTERN = /^(?:[01]\d|2[0-3]):(?:00|30)$/;
 export const DEFAULT_ACCOUNT_ID = 'default';
 export const TERMINAL_TASK_STATUSES = new Set(['confirmed', 'expired']);
 export const ACTIVE_TASK_STATUSES = new Set(['active', 'backoff']);
@@ -111,6 +113,33 @@ export function migrateStoredInterval(record) {
   return canonical;
 }
 
+function validTimeSelection(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 48) return false;
+  for (const time of value) if (typeof time !== 'string' || !HALF_HOUR_PATTERN.test(time)) return false;
+  return true;
+}
+
+function selectedTimeSlots(value) {
+  if (!validTimeSelection(value)) {
+    throw new HttpError(400, '请至少选择一个预约时间，时间须以半小时为单位（例如 14:00、14:30）。');
+  }
+  return [...new Set(value)].sort();
+}
+
+// An absent selection keeps the exact range behavior of existing tasks.
+// An invalid explicit selection must never expand into a broader time range.
+export function taskTimeSlots(task) {
+  if (!Object.hasOwn(task, 'timeSlots')) return null;
+  return validTimeSelection(task.timeSlots) ? task.timeSlots : [];
+}
+
+export function taskTimeMatches(task, time) {
+  if (typeof time !== 'string' || !TIME_PATTERN.test(time)) return false;
+  const selected = taskTimeSlots(task);
+  return selected === null ? time >= task.timeStart && time <= task.timeEnd
+    : HALF_HOUR_PATTERN.test(time) && selected.includes(time);
+}
+
 export function createTask(input, defaults = {}, now = Date.now()) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new HttpError(400, '任务格式不正确。');
   const name = String(input.restaurantName || '').trim();
@@ -120,10 +149,10 @@ export function createTask(input, defaults = {}, now = Date.now()) {
   if (dates.some((date) => date < localDate(now))) throw new HttpError(400, '预约日期不能早于韩国当地今天。');
   const partySize = Number(input.partySize);
   if (!Number.isInteger(partySize) || partySize < 1 || partySize > 12) throw new HttpError(400, '预约人数须为 1—12 人。');
-  const timeStart = input.timeStart || '18:00';
-  const timeEnd = input.timeEnd || '21:00';
-  const timePattern = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
-  if (!timePattern.test(timeStart) || !timePattern.test(timeEnd) || timeStart > timeEnd) throw new HttpError(400, '请选择有效的起止时间，结束时间不能早于开始时间。');
+  const timeSlots = Object.hasOwn(input, 'timeSlots') ? selectedTimeSlots(input.timeSlots) : null;
+  const timeStart = timeSlots ? timeSlots[0] : input.timeStart || '18:00';
+  const timeEnd = timeSlots ? timeSlots.at(-1) : input.timeEnd || '21:00';
+  if (!TIME_PATTERN.test(timeStart) || !TIME_PATTERN.test(timeEnd) || timeStart > timeEnd) throw new HttpError(400, '请选择有效的起止时间，结束时间不能早于开始时间。');
   const mode = input.mode || 'assist';
   if (!['notify', 'assist', 'auto'].includes(mode)) throw new HttpError(400, '预约模式须为 notify、assist 或 auto。');
   if (mode === 'auto' && input.autoConsent !== true) throw new HttpError(400, '自动模式须明确确认授权，设置 autoConsent:true。');
@@ -134,7 +163,7 @@ export function createTask(input, defaults = {}, now = Date.now()) {
   const timestamp = new Date(now).toISOString();
   return {
     id: identifier('task'), restaurantName: name, restaurantUrl: restaurantUrl(input.restaurantUrl),
-    dates, partySize, timeStart, timeEnd, mode, groupId, deadline, autoConsent: mode === 'auto',
+    dates, partySize, timeStart, timeEnd, ...(timeSlots ? { timeSlots } : {}), mode, groupId, deadline, autoConsent: mode === 'auto',
     pollIntervalMs: resolvePollInterval(input, defaults.pollIntervalMs ?? (defaults.pollIntervalSeconds === undefined ? 1000 : migrateStoredInterval(defaults).pollIntervalMs)),
     source: 'live', status: 'paused', lastCheckedAt: null, nextCheckAt: null,
     lastCheckStartedAt: null, lastCheckDurationMs: null, effectiveIntervalMs: null,
@@ -147,8 +176,7 @@ export function matchingSlots(task, slots) {
   if (!Array.isArray(slots)) return [];
   const result = new Map();
   for (const slot of slots) {
-    if (!slot || !task.dates.includes(slot.date) || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(slot.time)
-      || slot.time < task.timeStart || slot.time > task.timeEnd || slot.partySize !== task.partySize) continue;
+    if (!slot || !task.dates.includes(slot.date) || !taskTimeMatches(task, slot.time) || slot.partySize !== task.partySize) continue;
     const safe = { date: slot.date, time: slot.time, partySize: slot.partySize };
     if (slot.seatType) safe.seatType = String(slot.seatType).slice(0, 120);
     if (slot.label) safe.label = String(slot.label).slice(0, 200);

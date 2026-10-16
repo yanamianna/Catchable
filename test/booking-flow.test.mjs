@@ -24,6 +24,14 @@ test('known same-day informational Next binds its card to the verified full cale
   }
 });
 
+test('official evening labels retain the exact same-day selected time',()=>{
+  const evening=sameDay({dialogs:[{...sameDay().dialogs[0],text:sameDayText.replace('下午 1:00','晚上 6:30')}]});
+  assert.equal(knownSameDayNotice(evening,noticeTask,{...noticeSlot,time:'18:30'},true),true);
+  assert.equal(knownSameDayNotice(evening,noticeTask,{...noticeSlot,time:'06:30'},true),false);
+  const ambiguous=sameDay({dialogs:[{...sameDay().dialogs[0],text:sameDayText.replace('下午 1:00','晚上 12:00')}]});
+  assert.equal(knownSameDayNotice(ambiguous,noticeTask,{...noticeSlot,time:'12:00'},true),false);
+});
+
 test('ambiguous, unchecked or unverified same-day notices cannot advance by borrowing the outer page data',()=>{
   const dialog=(changes={})=>sameDay({text:sameDayText,dialogs:[{...sameDay().dialogs[0],...changes}]});
   const blocked=[

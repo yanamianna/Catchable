@@ -243,7 +243,8 @@ export class Engine {
     }
     if (!['available', 'unavailable'].includes(observation?.status)) {
       const failures = (task.failureCount || 0) + 1;
-      const delay = Math.min(600000, Math.max(1000, task.pollIntervalMs) * 2 ** Math.min(failures - 1, 4));
+      const retryAfterMs=Number.isFinite(observation?.retryAfterMs)?Math.max(0,observation.retryAfterMs):0;
+      const delay = Math.min(600000, Math.max(retryAfterMs, Math.max(1000, task.pollIntervalMs) * 2 ** Math.min(failures - 1, 4)));
       const message = observation?.message || '目前无法判断空位，保留上次有效结果并延后重试。';
       this.store.patchTask(id, { ...metrics, status: preservePaused ? 'paused' : 'backoff', lastCheckedAt: timestamp, lastObservationStatus: 'unknown',
         nextCheckAt: preservePaused ? null : new Date(this.now() + delay).toISOString(), failureCount: failures, lastMessage: message, checkCount: count }, timestamp);
@@ -287,6 +288,7 @@ export class Engine {
   }
 
   async prepareTask(task, slot, { adapter = this.adapter, handoff = false, inspectionId } = {}) {
+    if(!matchingSlots(task,[slot]).length)throw new HttpError(409,'该空位不在任务选定的日期、人数或时间内，不能预约。');
     if (Date.parse(task.deadline) <= this.now() || slot.date < localDate(this.now())) throw new HttpError(409, '任务已过期或空位日期已过去，不能继续预约。');
     if (task.source === 'live' && this.store.hasUncertainLiveAttempt()) throw new HttpError(409, '账户有结果不明的提交，新预订已阻止。请先核验已有预约。');
     const pending = this.store.attemptsForTask(task.id).find((attempt) => PENDING_ATTEMPT_STATUSES.has(attempt.status));
@@ -388,7 +390,9 @@ export class Engine {
     let result;
     let failed=false;
     this.currentTaskId=attempt.taskId;
-    try { result = await adapter.reconcile({ ...attempt, task: attempt.taskSnapshot || task }); }
+    try { result = this.attemptIdentityMatches(attempt)
+      ?await adapter.reconcile({ ...attempt, task: attempt.taskSnapshot || task })
+      :{status:'outcome_unknown',message:'这笔预约属于更换前的登录账号，不能使用当前账号核验或继续提交。'}; }
     catch (error) {failed=true;result = { status: 'outcome_unknown', message: safeMessage(error, '暂时无法核验预约。') }; }
     finally {this.currentTaskId=null;}
     this.finishAttempt(attempt,result,{verification:true,verificationFailed:failed,adapter});
@@ -401,7 +405,7 @@ export class Engine {
     const current=this.store.getAttempt(attempt.id);
     const task=this.store.getTask(attempt.taskId);
     const before=record=>record?.status==='user_action_required' && ['before_submit','authentication'].includes(record.phase) && record.submitted===false && !record.reservationId;
-    return attempt.legacyIdentityUnverified!==true && result?.resumeAllowed===true && before(attempt) && before(current) && before(result)
+    return this.attemptIdentityMatches(attempt) && attempt.legacyIdentityUnverified!==true && result?.resumeAllowed===true && before(attempt) && before(current) && before(result)
       && task?.source==='live' && task.mode==='auto' && task.autoConsent===true && task.status!=='paused' && task.status!=='expired'
       && Date.parse(task.deadline)>this.now() && current.slot.date>=localDate(this.now()) && !this.stopped && !this.store.settings().enginePaused
       && this.session.status==='authenticated' && this.session.connected===true && adapter.hasContext===true && typeof adapter.continueAttempt==='function';
@@ -414,8 +418,10 @@ export class Engine {
       used=true;
       const task=this.task(attempt.taskId);
       const current=this.store.getAttempt(attempt.id);
+      if(!this.attemptIdentityMatches(current))throw new HttpError(409,'这笔预约属于更换前的登录账号，不能使用当前账号提交。');
       if(current?.legacyIdentityUnverified===true)throw new HttpError(409,'旧预约尚未保存原账号身份，只能先在官网核验并处理，不能自动继续提交。');
       if(!current || current.source!=='live' || task.source!=='live' || task.mode!=='auto' || task.autoConsent!==true)throw new HttpError(409,'这次尝试没有真实自动预约授权，不能提交。');
+      if(!matchingSlots(task,[current.slot]).length || !matchingSlots(current.taskSnapshot || task,[current.slot]).length)throw new HttpError(409,'预约空位与任务或原预约条件不一致，不能提交。');
       if(this.session.status!=='authenticated' || this.session.connected!==true || this.adapter.hasContext!==true)throw Object.assign(new HttpError(409,'请先连接并核验官方登录会话；会话有效且专用浏览器已连接时才能提交。'),{code:'AUTH_REQUIRED'});
       if(typeof this.adapter.isBookingAuthenticated==='function' && !this.adapter.isBookingAuthenticated(task.id)) {
         this.applySession(this.adapter.lastSession || {status:'unknown',browserOpen:true,browserMode:'controlled',message:'当前订座页尚未通过新的官方会话核验。'});
@@ -448,11 +454,18 @@ export class Engine {
     return {bookingContact:{countryCode:contact.bookingPhoneCountryCode,phoneNumber:contact.bookingPhoneNumber,...(settings.bookingName?{fullName:settings.bookingName}:{})}};
   }
 
+  attemptIdentityMatches(attempt) {
+    if(!attempt || attempt.source!=='live' || !attempt.accountIdentityFingerprint)return true;
+    const account=this.store.getAccount?.();
+    return Boolean(account && !account.deletedAt && account.identityFingerprint===attempt.accountIdentityFingerprint);
+  }
+
   async continueAutoTask(task,adapter=this.adapter,{automatic=false,attemptId=null}={}) {
     if(task.source!=='live' || task.mode!=='auto' || task.autoConsent!==true)throw new HttpError(409,'只有明确授权的真实自动预约任务可以继续。');
     if(this.session.status!=='authenticated' || this.session.connected!==true || adapter.hasContext!==true)throw new HttpError(409,'请先连接并核验官方登录会话；会话有效且专用浏览器已连接时才能继续预约。');
     const attempt=attemptId?this.store.getAttempt(attemptId):this.store.attemptsForTask(task.id).find(item=>VERIFIABLE_ATTEMPT_STATUSES.has(item.status));
     if(!attempt || attempt.taskId!==task.id || !VERIFIABLE_ATTEMPT_STATUSES.has(attempt.status))throw new HttpError(409,'没有可继续处理的原预约尝试。');
+    if(!this.attemptIdentityMatches(attempt))throw new HttpError(409,'这笔预约属于更换前的登录账号，不能使用当前账号继续。');
     if(typeof adapter.continueAttempt!=='function')throw new HttpError(409,'当前适配器尚未支持继续原表单，请先只读核验。');
     if(automatic) {
       this.store.saveAttempt({...attempt,autoContinueCount:(attempt.autoContinueCount || 0)+1,updatedAt:this.timestamp()});

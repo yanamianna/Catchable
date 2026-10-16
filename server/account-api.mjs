@@ -19,7 +19,7 @@ export async function accountApi({coordinator:c,url,method,body,request,port}) {
   if(accountRoute) {
     const id=decodeURIComponent(accountRoute[1]),action=accountRoute[2];c.account(id);
     if(!action && method==='POST')return {value:{account:c.updateAccount(id,body)}};
-    if(action==='action' && method==='POST')return {value:c.accountAction(id,body.action)};
+    if(action==='action' && method==='POST')return {value:await c.accountAction(id,body.action,body)};
     if(action==='pairing' && method==='GET') {
       if(!trustedPairingRead(request,port))throw new HttpError(403,'配对信息只能从本机系统页面读取。');
       return {value:typeof c.broker.simplePairingInfo==='function'?c.broker.simplePairingInfo(id):c.broker.pairingInfo(id)};

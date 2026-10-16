@@ -7,6 +7,7 @@ import { Icon } from './Icon';
 import { IntervalInput, intervalValidation } from './IntervalInput';
 import { RestaurantPreview } from './RestaurantPreview';
 import { accountAuthenticated } from './Accounts';
+import { HALF_HOUR_TIMES, halfHourRange } from '../time-slots';
 
 const modeOptions = [
   { value: 'notify', label: '空位提醒', detail: '发现空位后通知你' },
@@ -53,6 +54,7 @@ export function NewTaskModal({ onClose, onCreate, interval, currentDate, account
   const [party, setParty] = useState(2);
   const [from, setFrom] = useState('18:00');
   const [to, setTo] = useState('20:00');
+  const [timeSlots, setTimeSlots] = useState(() => halfHourRange('18:00', '20:00'));
   const [group, setGroup] = useState('');
   const [poll, setPoll] = useState(() => String(accounts.find(account => account.id === accountId)?.settings.pollIntervalMs ?? interval));
   const [consent, setConsent] = useState(false);
@@ -61,7 +63,7 @@ export function NewTaskModal({ onClose, onCreate, interval, currentDate, account
   const mounted = useRef(true);
   const lookup = useRef<AbortController | null>(null);
   const submitting = useRef(false);
-  const preferenceTouched = useRef({ party: false, from: false, to: false });
+  const preferenceTouched = useRef({ party: false, times: false });
   const intervalTouched = useRef(false);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; sequence.current += 1; lookup.current?.abort(); }; }, []);
 
@@ -80,6 +82,18 @@ export function NewTaskModal({ onClose, onCreate, interval, currentDate, account
     sequence.current += 1; lookup.current?.abort(); lookup.current = null;
     setResolving(false); setResolveError('已停止等待，可重试或手动填写餐厅名。');
     if (!restaurant) setManualName(true);
+  }
+  function changeRange(edge: 'from' | 'to', value: string) {
+    preferenceTouched.current.times = true;
+    const startTime = edge === 'from' ? value : value < from ? value : from;
+    const endTime = edge === 'to' ? value : value > to ? value : to;
+    setFrom(startTime); setTo(endTime); setTimeSlots(halfHourRange(startTime, endTime));
+    setError('');
+  }
+  function toggleTime(time: string) {
+    preferenceTouched.current.times = true;
+    setTimeSlots(previous => previous.includes(time) ? previous.filter(value => value !== time) : [...previous, time].sort());
+    setError('');
   }
   async function resolveRestaurant() {
     setResolveError(''); setError('');
@@ -100,8 +114,10 @@ export function NewTaskModal({ onClose, onCreate, interval, currentDate, account
       setRestaurant(info); setName(info.restaurantName); setManualName(false);
       const defaults = info.defaults;
       if (!preferenceTouched.current.party && defaults && Number.isInteger(defaults.partySize) && defaults.partySize >= 1 && defaults.partySize <= 12) setParty(defaults.partySize);
-      if (!preferenceTouched.current.from && defaults && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(defaults.timeStart)) setFrom(defaults.timeStart);
-      if (!preferenceTouched.current.to && defaults && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(defaults.timeEnd)) setTo(defaults.timeEnd);
+      if (!preferenceTouched.current.times && defaults && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(defaults.timeStart) && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(defaults.timeEnd)) {
+        const suggested = halfHourRange(defaults.timeStart, defaults.timeEnd);
+        if (suggested.length) { setFrom(suggested[0]); setTo(suggested[suggested.length - 1]); setTimeSlots(suggested); }
+      }
     } catch (cause) {
       if (mounted.current && requestId === sequence.current && !controller.signal.aborted) {
         setResolveError(cause instanceof Error ? cause.message : '餐厅详情暂时无法读取，请重试。');
@@ -120,13 +136,13 @@ export function NewTaskModal({ onClose, onCreate, interval, currentDate, account
       if (resolving) throw new Error('餐厅正在核验，请稍候。');
       if (!restaurant && !manualName) throw new Error('请先核验餐厅，或选择手动填写餐厅名。');
       if (!name.trim()) throw new Error('请填写与官方页面一致的餐厅名称。');
-      if (from > to) throw new Error('结束时间不能早于开始时间。');
+      if (!timeSlots.length) throw new Error('请至少勾选一个预约时段。');
       const pollError = intervalValidation(poll);
       if (pollError) throw new Error(pollError);
       if (mode === 'auto' && !consent) throw new Error('请先确认免费预订授权条件。');
       const dates = buildDates(start, end);
       submitting.current = true; setBusy(true);
-      await onCreate({ accountId: selectedAccountId, restaurantName: name.trim(), restaurantUrl: restaurant?.restaurantUrl ?? parsedUrl, dates, partySize: party, timeStart: from, timeEnd: to, mode, groupId: group.trim() || undefined, pollIntervalMs: Number(poll), ...(mode === 'auto' ? { autoConsent: true } : {}) });
+      await onCreate({ accountId: selectedAccountId, restaurantName: name.trim(), restaurantUrl: restaurant?.restaurantUrl ?? parsedUrl, dates, partySize: party, timeStart: timeSlots[0], timeEnd: timeSlots[timeSlots.length - 1], timeSlots, mode, groupId: group.trim() || undefined, pollIntervalMs: Number(poll), ...(mode === 'auto' ? { autoConsent: true } : {}) });
       onClose();
     } catch (cause) { setError(cause instanceof Error ? cause.message : '创建失败，请重试。'); }
     finally { submitting.current = false; if (mounted.current) setBusy(false); }
@@ -143,13 +159,14 @@ export function NewTaskModal({ onClose, onCreate, interval, currentDate, account
         {restaurant ? <div className="full"><RestaurantPreview key={restaurant.restaurantUrl} restaurant={restaurant} /></div> : null}
         {restaurant || manualName ? <label className="field full">餐厅名称 <span className="required">*</span><input required maxLength={100} value={name} onInput={event => setName(event.currentTarget.value)} onChange={event => setName(event.target.value)} placeholder="与 Catchtable 页面一致的官方餐厅名称" /><span className="field-help">{restaurant && name.trim() === restaurant.restaurantName ? '已从官方餐厅页自动填写。' : restaurant ? '名称已修改，请保持与官方页面一致，以便核验预订凭证。' : '手动名称尚未核验，请保持与官方页面一致。'}</span></label> : null}
       </div>
-      <div className="task-prefill-summary" style={{ marginTop: 20 }}><strong>{restaurant ? '已预填，可修改' : '用餐条件已预填，可修改'}</strong><p>{start === end ? start || '请选择日期' : `${start || '开始日期'} 至 ${end || '结束日期'}`} · {party} 人 · {from}–{to} 韩国时间 · 检查间隔 {poll || '待填写'}ms · 创建后暂停</p></div>
+      <div className="task-prefill-summary" style={{ marginTop: 20 }}><strong>{restaurant ? '已预填，可修改' : '用餐条件已预填，可修改'}</strong><p>{start === end ? start || '请选择日期' : `${start || '开始日期'} 至 ${end || '结束日期'}`} · {party} 人 · {timeSlots.length ? `${timeSlots.length} 个时段：${timeSlots.join('、')}` : '尚未勾选时段'} · 韩国时间 · 检查间隔 {poll || '待填写'}ms · 创建后暂停</p></div>
       <div className="form-grid">
         <label className="field">开始日期<input required type="date" min={currentDate} value={start} onInput={event => setStart(event.currentTarget.value)} onChange={event => setStart(event.target.value)} /></label>
         <label className="field">结束日期<input required type="date" min={start} value={end} onInput={event => setEnd(event.currentTarget.value)} onChange={event => setEnd(event.target.value)} /></label>
         <label className="field full">用餐人数<select value={party} onChange={event => { preferenceTouched.current.party = true; setParty(Number(event.target.value)); }}>{Array.from({ length: 12 }, (_, index) => <option key={index + 1} value={index + 1}>{index + 1} 人</option>)}</select></label>
-        <label className="field">最早时间<input required type="time" value={from} onInput={event => { preferenceTouched.current.from = true; setFrom(event.currentTarget.value); }} onChange={event => { preferenceTouched.current.from = true; setFrom(event.target.value); }} /></label>
-        <label className="field">最晚时间<input required type="time" value={to} onInput={event => { preferenceTouched.current.to = true; setTo(event.currentTarget.value); }} onChange={event => { preferenceTouched.current.to = true; setTo(event.target.value); }} /></label>
+        <label className="field">开始时间<select aria-label="开始时间" value={from} onChange={event => changeRange('from', event.target.value)}>{HALF_HOUR_TIMES.map(time => <option key={time} value={time}>{time}</option>)}</select></label>
+        <label className="field">结束时间<select aria-label="结束时间" value={to} onChange={event => changeRange('to', event.target.value)}>{HALF_HOUR_TIMES.map(time => <option key={time} value={time}>{time}</option>)}</select></label>
+        <fieldset className="time-slots-field full"><legend>预约时段 · 韩国时间 <span className="optional">已选 {timeSlots.length} 个</span></legend><div className="time-slot-actions"><span>仅检查勾选的时间，每半小时一档。</span><button type="button" className="text-button" onClick={() => { preferenceTouched.current.times = true; setTimeSlots(halfHourRange(from, to)); setError(''); }}>全选</button><button type="button" className="text-button" onClick={() => { preferenceTouched.current.times = true; setTimeSlots([]); }}>清空</button></div><div className="time-slot-grid">{halfHourRange(from, to).map(time => <label key={time} className={`time-slot-option ${timeSlots.includes(time) ? 'selected' : ''}`}><input type="checkbox" aria-label={`预约时段 ${time}`} checked={timeSlots.includes(time)} onChange={() => toggleTime(time)} /><span>{time}</span></label>)}</div></fieldset>
         <div className="field full"><span>订座方式</span><div className="mode-options">{modeOptions.map(option => <label className={`mode-option ${mode === option.value ? 'selected' : ''}`} key={option.value}><input type="radio" name="mode" value={option.value} checked={mode === option.value} onChange={() => setMode(option.value)} /><strong>{option.label}</strong><span>{option.detail}</span></label>)}</div><p className="task-mode-help">{modeDescriptions[mode]}</p></div>
         {mode === 'auto' ? <label className="consent full"><input type="checkbox" required checked={consent} onChange={event => setConsent(event.target.checked)} /><span>我授权仅为此餐厅、所选日期／时间／人数，在页面明确免费且无需新绑定条款确认时自动核对并完成已识别的确认步骤。涉及押金、支付、验证码或未知表单时交由我处理；结果不明时先核验，避免重复提交。</span></label> : null}
       </div>

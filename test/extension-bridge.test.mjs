@@ -164,6 +164,46 @@ test('activating an owned page restores scoped focus emulation without touching 
   ]);
 });
 
+test('background locator functions initialize focus once per owned page session without activating the tab',async t=>{
+  const f=await fixture(t);const w=await worker(f);
+  await f.bridge.requestCDP('Target.setAutoAttach',{autoAttach:true,flatten:true});
+  const before=w.commands.length;
+  const expression={functionDeclaration:'function(){return document.title;}'};
+  await Promise.all(Array.from({length:3},()=>f.bridge.requestCDP('Runtime.callFunctionOn',expression,'session-1')));
+  const commands=w.commands.slice(before);
+  assert.equal(commands[0].method,'Emulation.setFocusEmulationEnabled');
+  assert.deepEqual(commands[0].params,{enabled:true});assert.equal(commands[0].sessionId,'session-1');
+  assert.equal(commands.filter(command=>command.method==='Emulation.setFocusEmulationEnabled').length,1);
+  assert.equal(commands.filter(command=>command.method==='Runtime.callFunctionOn').length,3);
+  assert.equal(commands.some(command=>['Page.bringToFront','Target.activateTarget'].includes(command.method)),false);
+  await f.bridge.requestCDP('Runtime.callFunctionOn',expression,'session-1');
+  assert.equal(w.commands.filter(command=>command.method==='Emulation.setFocusEmulationEnabled').length,1,'later API/locator polls reuse the established focus state');
+  w.event('Target.attachedToTarget',{sessionId:'child-focus',targetInfo:{...target,targetId:'iframe-focus',type:'iframe'},waitingForDebugger:false},'session-1');
+  await delay(10);await f.bridge.requestCDP('Runtime.callFunctionOn',expression,'child-focus');
+  assert.equal(w.commands.filter(command=>command.method==='Emulation.setFocusEmulationEnabled').length,1,'iframe sessions do not change page focus');
+  w.event('Target.detachedFromTarget',{sessionId:'session-1',targetId:target.targetId});await delay(10);
+  w.event('Target.attachedToTarget',{sessionId:'session-1',targetInfo:target,waitingForDebugger:false});await delay(10);
+  await f.bridge.requestCDP('Runtime.callFunctionOn',expression,'session-1');
+  assert.equal(w.commands.filter(command=>command.method==='Emulation.setFocusEmulationEnabled').length,2,'reattachment establishes fresh focus even when Chrome reuses the session ID');
+  await f.bridge.requestCDP('Page.bringToFront',{},'session-1');
+  assert.equal(w.commands.at(-1).method,'Page.bringToFront');assert.equal(w.commands.filter(command=>command.method==='Emulation.setFocusEmulationEnabled').length,2);
+});
+
+test('a detached page cannot run a queued locator after its focus initialization finishes',async t=>{
+  const f=await fixture(t);let focus;
+  const w=await worker(f,(command,api)=>{
+    if(command.method==='Target.setAutoAttach') {api.event('Target.attachedToTarget',{sessionId:'session-1',targetInfo:target,waitingForDebugger:false});api.result(command);}
+    else if(command.method==='Emulation.setFocusEmulationEnabled')focus={command,api};
+    else api.result(command);
+  });
+  await f.bridge.requestCDP('Target.setAutoAttach',{autoAttach:true});
+  const pending=assert.rejects(f.bridge.requestCDP('Runtime.callFunctionOn',{functionDeclaration:'function(){return document.title;}'},'session-1'),error=>error.code==='EXTENSION_TARGET_BLOCKED');
+  await until(()=>focus);
+  w.event('Target.detachedFromTarget',{sessionId:'session-1',targetId:target.targetId});await delay(10);
+  focus.api.result(focus.command);await pending;
+  assert.equal(w.commands.some(command=>command.method==='Runtime.callFunctionOn'),false);
+});
+
 test('response body access requires an observed official response; sensitive headers are removed',async t=>{
   const f=await fixture(t);const w=await worker(f);
   await f.bridge.requestCDP('Target.setAutoAttach',{autoAttach:true,flatten:true});
@@ -217,16 +257,19 @@ test('detaching a root or destroying a target invalidates descendant sessions an
 });
 
 test('timeouts and disconnect fail pending commands without replaying writes',async t=>{
-  const f=await fixture(t,{commandTimeoutMs:40});
+  const f=await fixture(t,{commandTimeoutMs:5000});
   const w=await worker(f,(command,api)=>{
     if(command.method==='Target.setAutoAttach'){api.event('Target.attachedToTarget',{sessionId:'session-1',targetInfo:target,waitingForDebugger:false});api.result(command);}
+    else if(command.method==='Input.dispatchMouseEvent' && command.params.type==='mouseReleased')api.socket.terminate();
   });
   await f.bridge.requestCDP('Target.setAutoAttach',{autoAttach:true});
+  f.bridge.commandTimeoutMs=40;
   await assert.rejects(f.bridge.requestCDP('Input.dispatchMouseEvent',{type:'mousePressed',x:1,y:1},'session-1'),error=>error.code==='EXTENSION_COMMAND_TIMEOUT');
   assert.equal(w.commands.filter(command=>command.method==='Input.dispatchMouseEvent').length,1);
-  const pending=assert.rejects(f.bridge.requestCDP('Input.dispatchMouseEvent',{type:'mouseReleased',x:1,y:1},'session-1'),error=>error.code==='EXTENSION_DISCONNECTED');
-  await until(()=>w.commands.filter(command=>command.method==='Input.dispatchMouseEvent').length===2);
-  w.socket.close();await pending;
+  // Observe the disconnect inside the worker's receive callback. A 40ms
+  // deadline must not race a polling loop and WebSocket close handshake.
+  f.bridge.commandTimeoutMs=5000;
+  await assert.rejects(f.bridge.requestCDP('Input.dispatchMouseEvent',{type:'mouseReleased',x:1,y:1},'session-1'),error=>error.code==='EXTENSION_DISCONNECTED');
   assert.equal(w.commands.filter(command=>command.method==='Input.dispatchMouseEvent').length,2);
   assert.equal(f.bridge.state().connected,false);
 });

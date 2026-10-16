@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, useAppState } from './api';
 import type { Account, AccountFormValues, NewTask, Page, RecordKind, Task } from './types';
 import { Activity, Sidebar } from './components/Layout';
@@ -15,6 +15,7 @@ import type { TaskFilter } from './components/Tasks';
 import type { BookingFilter, NotificationFilter } from './components/Records';
 import { TaskDetails } from './components/TaskDetails';
 import { Accounts } from './components/Accounts';
+import type { AccountLifecycleAction } from './components/Accounts';
 
 export default function App() {
   const [accountScope, setAccountScope] = useState('all');
@@ -31,6 +32,8 @@ export default function App() {
   const [noReservation, setNoReservation] = useState(false);
   const notificationIds = useRef<Set<string> | null>(null);
   const actionLocks = useRef(new Set<string>());
+  const currentData = useRef({ accounts, state, accountScope });
+  currentData.current = { accounts, state, accountScope };
   useEffect(() => { notificationIds.current = null; }, [accountScope]);
   useEffect(() => {
     if (!state) return;
@@ -45,14 +48,15 @@ export default function App() {
   }, [state]);
   useEffect(() => { if (!notice) return; const timeout = window.setTimeout(() => setNotice(null), notice.error ? 10000 : 5500); return () => window.clearTimeout(timeout); }, [notice]);
 
-  async function perform<T>(key: string, operation: () => Promise<T>, message?: string) {
+  const perform = useCallback(async <T,>(key: string, operation: () => Promise<T>, message?: string, refreshAfter = true) => {
     if (actionLocks.current.has(key)) throw new Error('这项操作仍在处理中，请稍后再试。');
     actionLocks.current.add(key); setPending(previous => new Set(previous).add(key));
-    try { const result = await operation(); await refresh(); if (message) setNotice({ message }); return result; }
+    try { const result = await operation(); if (refreshAfter) await refresh(); if (message) setNotice({ message }); return result; }
     catch (cause) { setNotice({ message: cause instanceof Error ? cause.message : '操作失败，请重试。', error: true }); throw cause; }
     finally { actionLocks.current.delete(key); setPending(previous => { const next = new Set(previous); next.delete(key); return next; }); }
-  }
-  function onTaskAction(task: Task, action: TaskAction) {
+  }, [refresh]);
+  const onTaskAction = useCallback((task: Task, action: TaskAction) => {
+    const { accounts, state } = currentData.current;
     const owner = accounts.find(account => account.id === task.accountId);
     const ownerPaused = !!state?.engine.paused || !!owner?.settings.enginePaused || owner?.enabled === false;
     if (action === 'abandon') { setNoReservation(false); setAbandonTask(task); return; }
@@ -65,7 +69,7 @@ export default function App() {
       }
       return result;
     }, action === 'delete' ? '任务已删除。' : action === 'start' ? ownerPaused ? '任务已启用，账号或全局调度仍暂停。' : '任务已启动，运行结果会显示在动态中。' : action === 'pause' ? '任务已暂停。' : action === 'check' ? '已完成本次检查，请查看任务状态。' : action === 'reconcile' ? '核验已完成，请查看预约记录。' : action === 'continue_auto' ? '已继续处理原预约，后续结果会自动同步到预约记录。' : undefined).catch(() => {});
-  }
+  }, [perform]);
   async function sessionAction(accountId: string, action: 'open' | 'check', mode?: LoginMode) {
     const result = await perform(`session:${accountId}`, () => api<{ session?: { message?: string } }>(`/api/accounts/${encodeURIComponent(accountId)}/session/${action}`, action === 'open' && mode ? { mode } : {}));
     setNotice({ message: result.session?.message ?? '此账号登录状态已更新。' });
@@ -82,13 +86,21 @@ export default function App() {
     if (!accountId && result.account?.id) selectAccount(result.account.id);
   }
   function toggleAccount(account: Account) { void perform(`account:${account.id}`, () => api(`/api/accounts/${encodeURIComponent(account.id)}/action`, { action: account.enabled ? 'disable' : 'enable' }), account.enabled ? '账号已停用。' : '账号已启用，暂停任务不会自动启动。').catch(() => {}); }
+  async function accountLifecycle(account: Account, action: AccountLifecycleAction) {
+    await perform(`account:${account.id}`, () => api(`/api/accounts/${encodeURIComponent(account.id)}/action`, { action, confirm: true }), action === 'delete' ? '账号已删除，历史预约记录保留。' : '旧身份和预填资料已清空。请核验新登录，任务仍暂停。', action !== 'delete');
+    if (action === 'delete') {
+      if (currentData.current.accountScope === account.id) selectAccount('all');
+      else await refresh();
+    }
+  }
   function clearRecords(kind: RecordKind) {
     const labels = { events: '运行动态', notifications: '全部通知', bookings: '已结束预约记录', all: '历史消息记录' };
     void perform(`clear-records:${accountScope}`, () => api('/api/records/clear', { kind, accountId: accountScope }), `${labels[kind]}已清除。`).catch(() => {});
   }
   const clearBusy = accountScope === 'all' ? [...pending].some(key => key.startsWith('clear-records:')) : pending.has('clear-records:all') || pending.has(`clear-records:${accountScope}`);
-  function selectAccount(value: string) { setAccountScope(value); setDetailTaskId(null); setAbandonTask(null); }
-  function manageAccount(accountId: string) { selectAccount(accountId); setPage('accounts'); }
+  const selectAccount = useCallback((value: string) => { setAccountScope(value); setDetailTaskId(null); setAbandonTask(null); }, []);
+  const manageAccount = useCallback((accountId: string) => { selectAccount(accountId); setPage('accounts'); }, [selectAccount]);
+  const showTaskDetails = useCallback((task: Task) => setDetailTaskId(task.id), []);
   const availableEvents = state?.stats.availableEvents ?? 0;
   const pendingTasks = new Set(state?.tasks.filter(isPending).map(task => task.id) ?? []);
   state?.bookings.filter(booking => booking.source === 'live' && ['outcome_unknown','user_action_required','pending_restaurant','submitting'].includes(booking.status)).forEach(booking => pendingTasks.add(booking.taskId));
@@ -109,9 +121,9 @@ export default function App() {
     {page === 'tasks' ? <>
       {selectedAccount ? <SessionPanel key={selectedAccount.id} accountId={selectedAccount.id} bindingLabel={selectedAccount.label} state={{ settings: selectedAccount.settings, session: selectedAccount.session, extension: selectedAccount.extension }} busy={pending.has(`session:${selectedAccount.id}`)} compact onSession={(action, mode) => sessionAction(selectedAccount.id, action, mode)} onManage={() => navigate('accounts')} /> : <div className="account-overview"><span>{accounts.length} 个账号 · {accounts.filter(account => account.enabled).length} 个已启用{globalPaused ? ' · 全局暂停' : ''}</span><button type="button" className="button small" onClick={() => navigate('accounts')}>管理账号</button></div>}
       <div className="metrics" aria-label="订座统计">{metrics.map(metric => <button type="button" className="metric" key={metric.label} aria-label={`${metric.label} ${state ? metric.value : '—'}，${metric.detail}`} title={metric.detail} disabled={!state} onClick={metric.action}><span className={`metric-dot ${metric.color}`} /><div><span className="metric-label">{metric.label}</span><strong>{state ? metric.value : '—'}</strong><span className="metric-action">{metric.actionLabel}<Icon name="arrow" size={12} /></span></div></button>)}</div>
-      <Tasks state={state} loading={loading} pending={pending} filter={taskFilter} onFilter={setTaskFilter} onNew={() => setModal(true)} onDemo={() => { if (accountScope === 'all') { setNotice({ message: '请先选择一个账号运行演练。' }); return; } void perform('demo', () => api('/api/demo/run', { accountId: accountScope }), '演练已运行，所有模拟数据已标记。未查询或预订真实餐厅。').catch(() => {}); }} onEngine={() => engineAction()} enginePaused={accountScope === 'all' ? globalPaused : selectedAccount?.settings.enginePaused ?? false} engineBusy={pending.has(`engine:${accountScope}`)} engineLabel={selectedAccount?.label ?? '全部账号'} globalPaused={globalPaused} onGlobalSettings={() => navigate('settings')} accountDisabled={!!selectedAccount && !selectedAccount.enabled} onAccountManage={() => navigate('accounts')} onAction={onTaskAction} onDetails={task => setDetailTaskId(task.id)} onLogin={manageAccount} />
+      <Tasks state={state} loading={loading} pending={pending} filter={taskFilter} onFilter={setTaskFilter} onNew={() => setModal(true)} onDemo={() => { if (accountScope === 'all') { setNotice({ message: '请先选择一个账号运行演练。' }); return; } void perform('demo', () => api('/api/demo/run', { accountId: accountScope }), '演练已运行，所有模拟数据已标记。未查询或预订真实餐厅。').catch(() => {}); }} onEngine={() => engineAction()} enginePaused={accountScope === 'all' ? globalPaused : selectedAccount?.settings.enginePaused ?? false} engineBusy={pending.has(`engine:${accountScope}`)} engineLabel={selectedAccount?.label ?? '全部账号'} globalPaused={globalPaused} onGlobalSettings={() => navigate('settings')} accountDisabled={!!selectedAccount && !selectedAccount.enabled} onAccountManage={() => navigate('accounts')} onAction={onTaskAction} onDetails={showTaskDetails} onLogin={manageAccount} />
       {state?.tasks.some(task => task.source === 'demo') ? <p className="demo-footnote"><span className="badge demo">演练</span>模拟结果单独标记，不计入真实预约成功。可删除演练任务，历史模拟记录仍会保留。</p> : null}
-    </> : page === 'bookings' ? <Bookings state={state} filter={bookingFilter} onFilter={setBookingFilter} onTask={showTask} clearing={clearBusy} onClear={() => clearRecords('bookings')} /> : page === 'notifications' ? <Notifications state={state} filter={notificationFilter} onFilter={setNotificationFilter} onTask={showTask} clearing={clearBusy} onClear={() => clearRecords('notifications')} /> : page === 'accounts' ? <Accounts accounts={accounts} pending={pending} globalPaused={globalPaused} selectedAccountId={accountScope} onSave={saveAccount} onToggle={toggleAccount} onEngine={engineAction} onSession={(accountId, action, mode) => sessionAction(accountId, action, mode)} /> : <Settings state={state} pending={pending} onSave={settings => perform('settings', () => api('/api/settings', settings), '运行设置已保存。').then(() => {})} onEngine={() => engineAction('all')} onClear={() => clearRecords('all')} />}
+    </> : page === 'bookings' ? <Bookings state={state} filter={bookingFilter} onFilter={setBookingFilter} onTask={showTask} clearing={clearBusy} onClear={() => clearRecords('bookings')} /> : page === 'notifications' ? <Notifications state={state} filter={notificationFilter} onFilter={setNotificationFilter} onTask={showTask} clearing={clearBusy} onClear={() => clearRecords('notifications')} /> : page === 'accounts' ? <Accounts accounts={accounts} pending={pending} globalPaused={globalPaused} selectedAccountId={accountScope} onSave={saveAccount} onToggle={toggleAccount} onLifecycle={accountLifecycle} onEngine={engineAction} onSession={(accountId, action, mode) => sessionAction(accountId, action, mode)} /> : <Settings state={state} pending={pending} onSave={settings => perform('settings', () => api('/api/settings', settings), '运行设置已保存。').then(() => {})} onEngine={() => engineAction('all')} onClear={() => clearRecords('all')} />}
     <footer className="page-footer">餐厅时间以韩国时间为准 · Asia/Seoul <span>比北京时间快 1 小时</span></footer>
   </main><Activity state={state} clearing={clearBusy} onClear={() => clearRecords('events')} />
     {modal ? <NewTaskModal accounts={accounts} accountId={accountScope} interval={state?.settings.pollIntervalMs ?? 1000} currentDate={state?.engine.currentDate ?? new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Seoul' }).format(new Date())} onClose={() => setModal(false)} onCreate={(task: NewTask) => perform(`new-task:${task.accountId}`, () => api('/api/tasks', task), '任务已创建，启动后开始检查。').then(() => {})} /> : null}

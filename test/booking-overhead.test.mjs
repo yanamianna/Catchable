@@ -21,12 +21,12 @@ class OrderPage extends EventEmitter {
   async evaluate(){return this.receipt?{url:this.address,text:`${task.restaurantName}\nDate: 2030-01-02\nTime: 13:00\nParty size: 2 people\nConfirmed`,statusLabels:['Confirmed'],loading:false,captcha:false}:{url:this.address,text:'No reservations',cards:[],headings:[],buttons:[],summaries:[],links:[],dialogs:[],loading:false};}
 }
 function fixture(){
-  const adapter=new CatchtableAdapter();let pages=0,prepares=0,domReads=0;
+  const adapter=new CatchtableAdapter();let pages=0,prepares=0,domReads=0,orderReads=0;
   const flowPage=Object.assign(new EventEmitter(),{isClosed:()=>false,evaluate:async()=>{domReads++;return {...form};},getByRole:()=>({count:async()=>0})});
-  const context={on(){},newPage:async()=>{pages++;return new OrderPage();}};
+  const context={on(){},newPage:async()=>{pages++;const page=new OrderPage();const goto=page.goto.bind(page);page.goto=async url=>{orderReads++;return goto(url);};return page;}};
   adapter.context=context;adapter.bookingPages.set(task.id,flowPage);adapter.bookingFlows.set(task.id,{page:flowPage,slot:{...slot},calendarVerified:true});
   adapter.prepare=async()=>{prepares++;return {status:'user_action_required',phase:'before_submit',submitted:false};};
-  return {adapter,flowPage,context,get pages(){return pages;},get prepares(){return prepares;},get domReads(){return domReads;}};
+  return {adapter,flowPage,context,get pages(){return pages;},get prepares(){return prepares;},get domReads(){return domReads;},get orderReads(){return orderReads;}};
 }
 
 test('immediate continuation reuses only one fresh complete negative check and reads each flow step once',async()=>{
@@ -39,7 +39,8 @@ test('immediate continuation reuses only one fresh complete negative check and r
   assert.equal(f.pages,1,'no second order-page load for this same fresh continuation');
   assert.equal(f.domReads-before,2,'one continuation condition snapshot and one shared receipt/step snapshot');
   await f.adapter.continueAttempt(attempt);
-  assert.equal(f.pages,2,'the negative check is consumed once');
+  assert.equal(f.pages,1,'the existing order tab is reused');
+  assert.equal(f.orderReads,2,'the negative check is consumed once and the reused order page loads a fresh official response');
 });
 
 test('changed attempt, slot, context or expired proof requires another official order read',async()=>{
@@ -54,7 +55,8 @@ test('changed attempt, slot, context or expired proof requires another official 
       if(change==='age')Date.now=()=>originalNow()+6000;
       await f.adapter.continueAttempt(next);
     }finally {Date.now=originalNow;}
-    assert.equal(f.pages,2,change);
+    assert.equal(f.orderReads,2,change);
+    assert.equal(f.pages,change==='context'?2:1,change);
   }
 });
 
@@ -63,7 +65,21 @@ test('complete matching order receipt does not wait for a shop response that the
   const page=new OrderPage({receipt:true});page.close=async()=>{closes++;};
   adapter.context={on(){},newPage:async()=>page};
   const result=await adapter.reconcile({...attempt,status:'pending_restaurant',submitted:true,reservationId:'OVERHEAD-ORDER'});
-  assert.equal(result.status,'confirmed');assert.equal(result.reservationId,'OVERHEAD-ORDER');assert.equal(closes,1);
+  assert.equal(result.status,'confirmed');assert.equal(result.reservationId,'OVERHEAD-ORDER');assert.equal(closes,0);
+  await adapter.releaseTask(task.id);assert.equal(closes,1,'a completed task releases its dedicated read-only order page');
+});
+
+test('repeated order verification reuses its own tab, cancels unused listeners and preserves the pending form',async()=>{
+  const f=fixture();
+  for(let index=0;index<3;index++)assert.equal((await f.adapter.reconcile(attempt)).resumeAllowed,true);
+  const page=f.adapter.readOnlyPages.get('shared').page;
+  assert.equal(f.pages,1);assert.equal(f.orderReads,3,'each verification reloads official evidence');
+  assert.equal(f.adapter.bookingPages.get(task.id),f.flowPage);assert.equal(f.prepares,0);
+  assert.equal(page.listenerCount('response'),0);assert.equal(page.listenerCount('close'),0);
+  await page.close();
+  assert.equal((await f.adapter.reconcile(attempt)).resumeAllowed,true);
+  assert.equal(f.pages,2,'a closed helper is recreated once');assert.equal(f.orderReads,4);
+  assert.equal(f.adapter.bookingPages.get(task.id),f.flowPage);
 });
 
 test('task release clears task-owned maps and closes a shared task page once, preserving login and unrelated pages',async()=>{

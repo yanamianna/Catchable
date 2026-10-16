@@ -5,6 +5,7 @@ import {
   automaticSubmissionAllowed,
   calendarLabelToDate,
   CatchtableAdapter,
+  formConditionsVerified,
   normalizeTime,
   parseAvailability,
   reservationMatches,
@@ -85,6 +86,7 @@ test('time parsing handles midnight, noon and English, Chinese and Korean meridi
     ['6:30PM', '18:30'], ['06:30 am', '06:30'],
     ['上午 12:00', '00:00'], ['下午 12:00', '12:00'],
     ['下午6:30', '18:30'], ['6:30 下午', '18:30'],
+    ['晚上 6:30', '18:30'],
     ['오전 12:00', '00:00'], ['오후 12:00', '12:00'],
     ['오후 6:30', '18:30'], ['6:30 오후', '18:30'],
   ];
@@ -96,6 +98,7 @@ test('time parsing rejects ranges, labels and malformed clocks', () => {
     '', '24:00', '25:00', '18:60', '6:75 PM', '13:00 PM',
     '0:30 AM', '18:00 - 21:00', 'Opening hours 18:00',
     '下午 18:00', '오후 18:00', '18:00 AM', '18:00 remaining',
+    '晚上18:30', '晚上12:00', '晚上6:30PM', '下午6:30晚上', '晚上6:30下午',
   ];
   for (const input of rejected) assert.equal(normalizeTime(input), null, input);
 });
@@ -123,6 +126,44 @@ test('available slots are enabled time buttons tied to the selected date and par
   ] }), task);
   assert.equal(result.status, 'available');
   assert.deepEqual(result.slots.map(({ date, time, partySize }) => ({ date, time, partySize })), [slot]);
+});
+
+test('official evening time labels map to the exact selected calendar slot',()=>{
+  const selected={...task,timeSlots:['18:30']};
+  const result=parseAvailability(snapshot({buttons:[{text:'晚上 6:30',disabled:false},{text:'晚上 7:00',disabled:false},{text:'晚上18:30',disabled:false}]}),selected);
+  assert.equal(result.status,'available');
+  assert.deepEqual(result.slots,[{date:slot.date,time:'18:30',partySize:2,label:'晚上 6:30'}]);
+});
+
+test('calendar availability honors only selected half-hour times, including disjoint selections', () => {
+  const selected={...task,timeSlots:['18:00','19:00']};
+  const result=parseAvailability(snapshot({buttons:[
+    {text:'6:00 pm',disabled:false},{text:'6:15 pm',disabled:false},
+    {text:'6:30 pm',disabled:false},{text:'7:00 pm',disabled:false},
+  ]}),selected);
+  assert.deepEqual(result.slots.map(value=>value.time),['18:00','19:00']);
+  for(const timeSlots of [[],['18:15'],['18:00','bad'],null]) {
+    const rejected=parseAvailability(snapshot(),{...task,timeSlots});
+    assert.equal(rejected.status,'unavailable');assert.deepEqual(rejected.slots,[]);
+  }
+  assert.equal(parseAvailability(snapshot({buttons:[{text:'6:15 pm',disabled:false}]}),task).slots[0].time,'18:15','legacy ranges retain their original meaning');
+});
+
+test('booking form cannot validate an off-selection slot even when its own summary matches', () => {
+  const selected={...task,timeSlots:['18:00','19:00']};
+  const form={url:'https://www.catchtable.net/zh-CN/reservation/form',headings:['ZEST'],summaries:['2026-10-24 · 18:30 · 2人']};
+  assert.equal(formConditionsVerified(form,selected,{...slot,time:'18:30'},true),false);
+  assert.equal(formConditionsVerified({...form,summaries:['2026-10-24 · 19:00 · 2人']},selected,{...slot,time:'19:00'},true),true);
+});
+
+test('adapter rejects an off-selection preparation before opening any browser page', async () => {
+  const adapter=new CatchtableAdapter({contextFactory:async()=>assert.fail('off-selection preparation must not open a browser')});
+  const result=await adapter.prepare({...task,timeSlots:['18:00','19:00']},{...slot,time:'18:30'});
+  assert.equal(result.status,'rejected');assert.equal(result.submitted,false);assert.equal(adapter.watchPages.size,0);assert.equal(adapter.bookingPages.size,0);
+});
+
+test('read-only receipts remain verifiable for a historical slot outside a changed selection', () => {
+  assert.equal(reservationMatches(receipt(),{...task,timeSlots:['19:00']},slot),true);
 });
 
 test('date, party, restaurant and loading ambiguity never produce available slots', () => {

@@ -28,6 +28,17 @@
 .task-prefill-summary { border: 1px solid #e8eaf0; background: #fafbfc; padding: 13px 14px; border-radius: 6px; margin-bottom: 21px; }
 .task-prefill-summary strong { display: block; font-size: 12px; color: #697586; font-weight: 580; }
 .task-prefill-summary p { font-size: 11px; color: #8993a2; line-height: 1.8; margin-top: 6px; }
+.time-slots-field { margin: 0; padding: 0; border: 0; min-width: 0; }
+.time-slots-field legend { padding: 0; font-size: 12px; font-weight: 550; color: #5b616b; }
+.time-slot-actions { display: flex; align-items: center; gap: 12px; margin: 9px 0; font-size: 10px; color: #939baa; }
+.time-slot-actions > span { flex: 1; }
+.time-slot-actions .text-button { font-size: 10px; flex-shrink: 0; }
+.time-slot-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; max-height: 184px; overflow-y: auto; padding: 2px; }
+.time-slot-option { display: flex; align-items: center; justify-content: center; gap: 6px; min-height: 36px; padding: 7px 4px; border: 1px solid #e1e5eb; border-radius: 5px; color: #697586; font-size: 11px; cursor: pointer; }
+.time-slot-option.selected { border-color: #ff845d; background: #fff8f3; color: #e14b21; }
+.time-slot-option input { width: 12px; height: 12px; margin: 0; accent-color: var(--orange); }
+.time-slot-option:focus-within { outline: 2px solid #f4b9a4; outline-offset: 1px; }
+@media (max-width: 600px) { .time-slot-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }.time-slot-actions { gap: 10px; }.time-slot-option { min-height: 38px; } }
 .task-mode-help { font-size: 10px; color: #989fac; font-weight: 400; line-height: 1.8; margin-top: 9px; }
 .task-advanced { margin-top: 20px; border-top: 1px solid #eceef2; padding-top: 14px; }
 .task-advanced summary { font-size: 12px; color: #8791a0; cursor: pointer; }

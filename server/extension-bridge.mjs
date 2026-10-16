@@ -76,6 +76,7 @@ export class ExtensionBridge {
   #nextId = 1;
   #targets = new Map();
   #sessions = new Map();
+  #pageFocus = new Map();
   #sessionParents = new Map();
   #responses = new Map();
   #mainFrames = new Map();
@@ -263,7 +264,7 @@ export class ExtensionBridge {
       if (this.#extension !== socket) return;
       if (!handshakeFailed) this.#issue('worker_disconnected');
       this.#extension = null; this.#hello = null;
-      this.#targets.clear(); this.#sessions.clear(); this.#sessionParents.clear(); this.#responses.clear(); this.#mainFrames.clear();
+      this.#targets.clear(); this.#sessions.clear(); this.#pageFocus.clear(); this.#sessionParents.clear(); this.#responses.clear(); this.#mainFrames.clear();
       this.#rejectPending(bridgeError('Chrome 扩展已断开；未完成的命令不会自动重发。', 'EXTENSION_DISCONNECTED'));
       for (const client of this.#cdpClients) client.close(1011, 'Extension disconnected');
     });
@@ -296,6 +297,7 @@ export class ExtensionBridge {
   #forgetSession(sessionId) {
     const info = this.#sessions.get(sessionId);
     if (!info) return;
+    this.#pageFocus.delete(sessionId);
     this.#sessions.delete(sessionId); this.#sessionParents.delete(sessionId);
     for (const [child, parent] of this.#sessionParents) if (parent === sessionId) this.#forgetSession(child);
     for (const key of this.#responses.keys()) if (key.startsWith(`${sessionId}:`)) this.#responses.delete(key);
@@ -319,6 +321,7 @@ export class ExtensionBridge {
     if (message.method === 'Target.attachedToTarget') {
       const info = this.#targetInfo(params.targetInfo);
       if (!info || typeof params.sessionId !== 'string' || (parent && !this.#sessions.has(parent))) return;
+      this.#pageFocus.delete(params.sessionId);
       this.#targets.set(info.targetId, info); this.#sessions.set(params.sessionId, info);
       if (parent) this.#sessionParents.set(params.sessionId, parent);
       params.targetInfo = info;
@@ -367,14 +370,31 @@ export class ExtensionBridge {
     if (method === 'Network.getResponseBody' && !this.#responses.has(`${sessionId}:${params.requestId}`)) throw bridgeError('只能读取正常导航中已观察到的官方响应。', 'EXTENSION_COMMAND_BLOCKED');
   }
 
+  async #ensurePageFocus(sessionId) {
+    const info=this.#sessions.get(sessionId);
+    if(info?.type!=='page' || this.#sessionParents.has(sessionId))return;
+    let entry=this.#pageFocus.get(sessionId);
+    if(!entry) {
+      entry={info,promise:null};
+      entry.promise=this.requestCDP('Emulation.setFocusEmulationEnabled',{enabled:true},sessionId).catch(error=>{
+        if(this.#pageFocus.get(sessionId)===entry)this.#pageFocus.delete(sessionId);
+        throw error;
+      });
+      this.#pageFocus.set(sessionId,entry);
+    }
+    await entry.promise;
+    if(this.#sessions.get(sessionId)!==info || this.#pageFocus.get(sessionId)!==entry)throw bridgeError('助手页面会话已变化，未继续执行。','EXTENSION_TARGET_BLOCKED');
+  }
+
   async requestCDP(method, params = {}, sessionId) {
     if (!this.state().connected) throw bridgeError('Chrome 扩展尚未连接。', 'EXTENSION_NOT_CONNECTED');
     this.#validateCommand(method, params, sessionId);
     // noDefaults preserves the personal browser's settings, but also skips
-    // Playwright's focus emulation. Restore it only for an owned page being
-    // activated, so animation-frame action checks work in an occluded window.
-    if (method === 'Page.bringToFront' && this.#sessions.get(sessionId)?.type === 'page') {
-      await this.requestCDP('Emulation.setFocusEmulationEnabled', { enabled: true }, sessionId);
+    // Playwright's focus emulation. Background locator stability checks also
+    // need animation frames; enable it once for each owned top-level session
+    // without activating the user's browser tab or replaying any page action.
+    if (['Runtime.callFunctionOn','Page.bringToFront'].includes(method) && this.#sessions.get(sessionId)?.type === 'page') {
+      await this.#ensurePageFocus(sessionId);
     }
     if (method === 'Browser.getVersion') {
       const version = this.#hello.userAgent.match(/(?:Chrome|Chromium)\/([\d.]+)/)?.[1] || '1.0.0.0';
@@ -410,6 +430,7 @@ export class ExtensionBridge {
     if (method === 'Target.closeTarget' && result.success) {
       this.#forgetTarget(params.targetId);
     }
+    if(method==='Emulation.setFocusEmulationEnabled' && params.enabled!==true)this.#pageFocus.delete(sessionId);
     return result;
   }
 
@@ -434,15 +455,25 @@ export class ExtensionBridge {
     this.#pending.clear();
   }
 
-  async close() {
+  async close({revoke=false}={}) {
     if (this.#closed) return;
     this.#closed = true;
     if (this.#upgrade) this.#server?.off('upgrade', this.#upgrade);
     this.#rejectPending(bridgeError('本地扩展桥已停止；未完成命令不会重发。', 'EXTENSION_DISCONNECTED'));
     for (const client of this.#cdpClients) client.terminate();
-    this.#extension?.terminate();
+    const extension=this.#extension;
+    if(revoke && extension?.readyState===WebSocket.OPEN) {
+      // A policy close tells the installed worker to stop reconnecting with
+      // this retired account's code. The normal shutdown remains reconnectable.
+      await new Promise(done=>{
+        const finish=()=>{clearTimeout(timer);extension.off('close',finish);done();};
+        const timer=setTimeout(()=>{extension.terminate();finish();},300);
+        extension.once('close',finish);
+        extension.close(1008,'Account removed');
+      });
+    } else extension?.terminate();
     this.#cdpClients.clear(); this.#extension = null; this.#hello = null;
-    this.#targets.clear(); this.#sessions.clear(); this.#sessionParents.clear(); this.#responses.clear(); this.#mainFrames.clear();
+    this.#targets.clear(); this.#sessions.clear(); this.#pageFocus.clear(); this.#sessionParents.clear(); this.#responses.clear(); this.#mainFrames.clear();
     await Promise.all([this.#workerServer, this.#cdpServer].filter(Boolean).map(server => new Promise(done => server.close(() => done()))));
   }
 }
@@ -452,6 +483,7 @@ export class ExtensionBridge {
 export class ExtensionBroker {
   #bridges = new Map();
   #creating = new Map();
+  #removed = new Set();
   #server = null;
   #upgrade = null;
   #closed = false;
@@ -495,7 +527,7 @@ export class ExtensionBroker {
     // Registration is brief and serial; execution and browser commands remain
     // independent. Reserve persisted codes before generating any new aliases.
     const operation = this.#registration.then(async () => {
-      if (this.#closed) throw new Error('本地扩展服务已停止。');
+      if (this.#closed || this.#removed.has(accountId)) throw new Error('本地扩展服务已停止或账号已删除。');
       await this.#loadSimpleCodeOwners();
       if ([...this.#bridges.values()].some(existing => existing.matchesPairing(`pair.${bridge.pairingInfo().pairingCode}`)))
         throw new Error('账号扩展配对设置重复，暂未启用此账号连接。');
@@ -514,7 +546,7 @@ export class ExtensionBroker {
       const owners = this.#simpleCodeOwners.get(code);
       if ((owners && [...owners].some(id => id !== accountId)) || [...this.#bridges.values()].some(existing => existing.matchesPairing(`pair.${code}`)))
         throw new Error('账号简易配对设置重复，暂未启用此账号连接。');
-      if (this.#closed) throw new Error('本地扩展服务已停止。');
+      if (this.#closed || this.#removed.has(accountId)) throw new Error('本地扩展服务已停止或账号已删除。');
       this.#simpleCodeOwners.set(code, new Set([accountId]));
       bridge.setSimplePairingCode(code).setLabel(accountId === 'default' ? '默认账号' : accountId);
       if (this.#server) bridge.attach(this.#server, { listen: false });
@@ -527,6 +559,7 @@ export class ExtensionBroker {
 
   async ensureAccount(accountId = 'default') {
     if (this.#closed) throw new Error('本地扩展服务已停止。');
+    if (this.#removed.has(accountId)) throw new Error('该账号已删除，请使用新的账号连接。');
     if (typeof accountId !== 'string' || !ACCOUNT_PATTERN.test(accountId)) throw new Error('账号标识格式不正确。');
     if (this.#bridges.has(accountId)) return this.#bridges.get(accountId);
     if (this.#creating.has(accountId)) return this.#creating.get(accountId);
@@ -549,6 +582,15 @@ export class ExtensionBroker {
   state(accountId = 'default') { return this.getBridge(accountId).state(); }
   pairingInfo(accountId = 'default') { return this.getBridge(accountId).pairingInfo(); }
   simplePairingInfo(accountId = 'default') { return this.getBridge(accountId).simplePairingInfo(); }
+
+  async removeAccount(accountId) {
+    if(typeof accountId!=='string' || !ACCOUNT_PATTERN.test(accountId) || accountId==='default')throw new Error('不能移除默认账号连接。');
+    this.#removed.add(accountId);
+    await this.#creating.get(accountId)?.catch(()=>{});
+    const bridge=this.#bridges.get(accountId);
+    this.#bridges.delete(accountId);
+    if(bridge)await bridge.close({revoke:true});
+  }
 
   attach(server) {
     if (this.#closed || this.#server) throw new Error('本地扩展服务已停止或已绑定。');

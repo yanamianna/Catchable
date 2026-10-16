@@ -1,6 +1,6 @@
 // Only visible official reservation UI is evidence. Never read client stores,
 // tokens, or hidden React state to decide whether an order was created.
-import {restaurantUrl,validDate} from './domain.mjs';
+import {matchingSlots,restaurantUrl,validDate} from './domain.mjs';
 
 export function officialReservationRoute(value) {
   try {
@@ -64,17 +64,96 @@ export function knownSameDayNotice(snapshot,task,slot,calendarVerified) {
   if(dates.length!==1 || Number(dates[0][1])!==Number(slot.date.slice(5,7)) || Number(dates[0][2])!==Number(slot.date.slice(8))
     || dates[0][3].replace('天','日')!==weekday)return false;
   const times=lines.map(line=>{
-    const match=line.match(/^(?:(上午|下午)\s*)?(\d{1,2}):([0-5]\d)(?:\s*(AM|PM))?$/i);
+    const match=line.match(/^(?:(上午|下午|晚上)\s*)?(\d{1,2}):([0-5]\d)(?:\s*(AM|PM))?$/i);
     if(!match || (match[1] && match[4]))return null;
     let hour=Number(match[2]);const meridiem=match[1] || match[4]?.toUpperCase();
     if(hour>23 || (meridiem && (hour<1 || hour>12)))return null;
-    if(meridiem)hour=hour%12+(['下午','PM'].includes(meridiem)?12:0);
+    if(meridiem==='晚上' && hour===12)return null;
+    if(meridiem)hour=hour%12+(['下午','晚上','PM'].includes(meridiem)?12:0);
     return `${String(hour).padStart(2,'0')}:${match[3]}`;
   }).filter(Boolean);
   const people=lines.filter(line=>/^\d{1,2}$/.test(line));
   const next=(dialog.buttons || []).filter(button=>/^(?:下一步|Next)$/i.test(button.text?.trim() || ''));
   return times.length===1 && times[0]===slot.time && people.length===1 && Number(people[0])===slot.partySize
     && next.length===1 && next[0].disabled===false;
+}
+
+const RESTAURANT_NOTICE_ROWS=Object.freeze([
+  '当餐桌满座时，每桌最大使用时间为2小时。',
+  '如果所有桌位都已满，客人可以被安排坐在吧台。',
+  '如果您下一个预约迟到超过15分钟，可能无法提供座位。(如有变更，请提前与我们联系。)',
+  '2小时内停车费3,000日元，此后每增加10分钟收费1,000日元。',
+]);
+const noticeText=value=>String(value || '').replace(/\s+/g,'').replaceAll('（','(').replaceAll('）',')');
+const RESTAURANT_NOTICE_TEXT=noticeText(['注意事项',...RESTAURANT_NOTICE_ROWS,'请仔细阅读餐厅的注意事项',
+  'Please call the store if you want to make a reservation for 9 or more persons.','Seat selection is not available.','取消','下一步'].join('\n'));
+
+// This exact published restaurant notice describes seating, lateness and
+// optional parking. It is not proof of a free checkout or permission to accept
+// arbitrary legal terms, penalties, marketing or deposits.
+export function knownRestaurantNotice(snapshot,task,slot,calendarVerified) {
+  if(calendarVerified!==true || task?.mode!=='auto' || task?.autoConsent!==true || !snapshot || snapshot.loading || snapshot.captcha
+    || !validDate(slot?.date) || !Number.isInteger(slot?.partySize) || slot.partySize<1 || slot.partySize>=9
+    || !Array.isArray(task.dates) || !matchingSlots(task,[slot]).length
+    || !Array.isArray(snapshot.uncheckedAgreements) || snapshot.uncheckedAgreements.length
+    || !Array.isArray(snapshot.missingRequiredFields) || snapshot.missingRequiredFields.length
+    || snapshot.dialogs?.length!==1 || snapshot.restaurantNotices?.length!==1)return false;
+  try {
+    if(new URL(restaurantUrl(snapshot.url)).pathname.split('/').at(-1)!==new URL(restaurantUrl(task.restaurantUrl)).pathname.split('/').at(-1))return false;
+  }catch{return false;}
+  const notice=snapshot.restaurantNotices[0];
+  if(notice.heading!=='注意事项' || notice.linkCount!==0 || noticeText(notice.text)!==RESTAURANT_NOTICE_TEXT
+    || noticeText(snapshot.dialogs[0].text)!==RESTAURANT_NOTICE_TEXT || notice.rows?.length!==4 || notice.buttons?.length!==6)return false;
+  if(!notice.rows.every((row,index)=>noticeText(row.text)===noticeText(RESTAURANT_NOTICE_ROWS[index]) && typeof row.checked==='boolean' && row.disabled===false))return false;
+  const labels=[...notice.rows.map(row=>row.text),'取消','下一步'];
+  if(!notice.buttons.every((button,index)=>noticeText(button.text)===noticeText(labels[index]) && button.disabled===false))return false;
+  return notice.next?.text==='下一步' && notice.next.disabled===false && typeof notice.next.active==='boolean';
+}
+
+// A toggle is issued at most once. Even if its acknowledgement times out, a
+// fresh observed checked state decides whether it is safe to continue.
+export async function acknowledgeRestaurantNotice(page,task,slot,calendarVerified,{snapshot}={}) {
+  try {
+    let current=snapshot || await page.evaluate(readBookingFlowDom);
+    if(!current.restaurantNotices?.length)return null;
+    if(!knownRestaurantNotice(current,task,slot,calendarVerified))return 'blocked';
+    const dialog=page.getByRole('dialog').filter({has:page.getByRole('heading',{name:'注意事项',exact:true})});
+    if(await dialog.count()!==1 || !await dialog.isVisible())return 'blocked';
+    for(let index=0;index<4;index++) {
+      if(!knownRestaurantNotice(current,task,slot,calendarVerified))return 'blocked';
+      if(current.restaurantNotices[0].rows[index].checked)continue;
+      const row=current.restaurantNotices[0].rows[index];
+      const control=dialog.getByRole('button',{name:row.text,exact:true});
+      if(await control.count()!==1 || !await control.isVisible() || !await control.isEnabled())return 'blocked';
+      try {await control.click({timeout:5000});}catch{/* Never retry a possibly completed toggle. */}
+      let next=await page.evaluate(readBookingFlowDom);
+      if(next.restaurantNotices?.[0]?.rows?.[index]?.checked!==true) {
+        try {
+          const selected=await page.waitForFunction(label=>{
+            const visible=element=>Boolean(element.getBoundingClientRect().width && element.getBoundingClientRect().height && getComputedStyle(element).visibility!=='hidden');
+            const dialogs=[...document.querySelectorAll('[role="dialog"]')].filter(visible).filter(root=>[...root.querySelectorAll('h1,h2,h3,h4')].some(heading=>heading.innerText.trim()==='注意事项'));
+            if(dialogs.length!==1)return false;
+            const rows=[...dialogs[0].querySelectorAll('button')].filter(visible).filter(button=>button.innerText.trim()===label);
+            return rows.length===1 && rows[0].querySelector(':scope > svg')?.classList.contains('text-[#ff3d00]');
+          },row.text,{timeout:2000});
+          await selected.dispose();
+        }catch{return 'blocked';}
+        next=await page.evaluate(readBookingFlowDom);
+      }
+      if(!knownRestaurantNotice(next,task,slot,calendarVerified) || next.restaurantNotices[0].rows[index].checked!==true
+        || next.restaurantNotices[0].rows.some((value,other)=>other!==index && value.checked!==current.restaurantNotices[0].rows[other].checked))return 'blocked';
+      current=next;
+    }
+    current=await page.evaluate(readBookingFlowDom);
+    if(!knownRestaurantNotice(current,task,slot,calendarVerified) || !current.restaurantNotices[0].rows.every(row=>row.checked)
+      || current.restaurantNotices[0].next.active!==true)return 'blocked';
+    const next=dialog.getByRole('button',{name:'下一步',exact:true});
+    if(await next.count()!==1 || !await next.isVisible() || !await next.isEnabled())return 'blocked';
+    try {await next.click({timeout:5000});}catch{/* Its result is read, never replayed. */}
+    try {await dialog.waitFor({state:'hidden',timeout:5000});}catch{return 'blocked';}
+    const after=await page.evaluate(readBookingFlowDom);
+    return after.restaurantNotices?.length?'blocked':'advanced';
+  }catch{return 'blocked';}
 }
 
 export function classifyCheckout(snapshot, {conditionsVerified}) {
@@ -107,6 +186,25 @@ export function readBookingFlowDom() {
   }).filter(Boolean);
   const candidates=[...new Set([...document.querySelectorAll('[role="dialog"], [data-state="open"]'),...noticeRoots].filter(visible))];
   const dialogRoots=candidates.filter(element=>!candidates.some(other=>other!==element && other.contains(element)));
+  const restaurantNotices=dialogRoots.filter(root=>[...root.querySelectorAll('h1,h2,h3,h4')].filter(visible).some(heading=>heading.innerText.trim()==='注意事项')).map(root=>{
+    const controls=[...root.querySelectorAll('button')].filter(visible);
+    const rows=controls.flatMap(element=>{
+      const svg=element.querySelector(':scope > svg'),label=element.querySelector(':scope > span');
+      if(!svg || !label || svg.getAttribute('viewBox')!=='0 0 24 24')return [];
+      const rect=svg.querySelector('rect'),path=svg.querySelector('path');
+      if(!rect || !path || rect.getAttribute('x')!=='2' || rect.getAttribute('y')!=='2' || rect.getAttribute('width')!=='20'
+        || rect.getAttribute('height')!=='20' || rect.getAttribute('rx')!=='6' || rect.getAttribute('fill')!=='currentColor'
+        || path.getAttribute('d')!=='M7 11.803 10.476 15 17 9')return [];
+      const selected=svg.classList.contains('text-[#ff3d00]'),unselected=svg.classList.contains('text-[#d5d5d5]');
+      return [{text:label.innerText.trim(),checked:selected!==unselected?selected:null,disabled:element.disabled || element.getAttribute('aria-disabled')==='true'}];
+    });
+    const next=controls.filter(element=>element.innerText.trim()==='下一步');
+    const nextButton=next.length===1?next[0]:null;
+    const active=nextButton?.classList.contains('bg-[#ff3d00]') && nextButton.classList.contains('text-white');
+    const inactive=nextButton?.classList.contains('bg-[#f1f1f1]') && nextButton.classList.contains('text-[#c8c8c8]');
+    return {heading:'注意事项',text:root.innerText,buttons:buttons(root),rows,linkCount:root.querySelectorAll('a[href]').length,
+      next:nextButton?{text:nextButton.innerText.trim(),disabled:nextButton.disabled || nextButton.getAttribute('aria-disabled')==='true',active:active!==inactive?active:null}:null};
+  });
   const phones=[...document.querySelectorAll('input[type="tel"]')].filter(visible);
   const phone=phones.length===1?phones[0]:null;
   const phoneHeading=phone?.closest('section')?.querySelector('h3');
@@ -126,18 +224,70 @@ export function readBookingFlowDom() {
     return location.protocol==='https:' && ['www.catchtable.net','catchtable.net'].includes(location.hostname) && !location.port
       && /^\/(?:[a-z]{2}(?:-[A-Za-z]{2})?\/)?reservation\/form\/?$/.test(location.pathname);
   }
-  const missingRequired=[...document.querySelectorAll('input[required],textarea[required],select[required],[aria-required="true"]')].filter(visible).filter(element=>!element.value?.trim()).map(element=>names.includes(element)?'预约姓名':element.getAttribute('aria-label') || element.name || '必填信息');
+  const choiceGroups=officialForm()?(()=>{
+    const scopeSelector='section, fieldset, [role="radiogroup"]';
+    const scopes=[...document.querySelectorAll(scopeSelector)];
+    const answer=text=>/^(?:是|Yes|예|네)$/i.test(text.trim())?'yes':/^(?:否|No|아니오|아니요)$/i.test(text.trim())?'no':null;
+    const path=(root,element)=>{if(!root.contains(element))return [];const output=[];for(let node=element;node!==root;node=node.parentElement)output.unshift([...node.parentElement.children].indexOf(node)+1);return output;};
+    const controlLabel=element=>element.getAttribute('aria-label') || [...(element.labels || [])].filter(visible).map(label=>label.innerText.trim()).join(' ') || element.innerText?.trim() || '';
+    const option=(root,element,kind)=>{
+      const text=controlLabel(element);let selected=null,target=element;
+      if(kind==='native') {
+        selected=element.checked;
+        if(!visible(element))target=[...(element.labels || [])].filter(label=>visible(label) && root.contains(label)).at(0) || element;
+      }else if(kind==='aria')selected=['true','false'].includes(element.getAttribute('aria-checked'))?element.getAttribute('aria-checked')==='true':null;
+      else {
+        const circle=element.querySelector(':scope > span'),dot=circle?.querySelector(':scope > span');
+        if(element.getAttribute('type')==='button' && circle && dot && ['h-[20px]','w-[20px]','rounded-full','border','bg-white'].every(value=>circle.classList.contains(value))
+          && ['h-[12px]','w-[12px]','rounded-full'].every(value=>dot.classList.contains(value))) {
+          const on=circle.classList.contains('border-[#ff3d00]') && dot.classList.contains('bg-[#ff3d00]');
+          const off=circle.classList.contains('border-[#c4c4c4]') && dot.classList.contains('bg-[#c4c4c4]');
+          selected=on!==off?on:null;
+        }
+      }
+      return {text,value:answer(text),selected,disabled:element.matches(':disabled') || Boolean(element.closest('[aria-disabled="true"]')),
+        path:path(root,target)};
+    };
+    return scopes.flatMap((root,scopeIndex)=>{
+      if(!visible(root))return [];
+      const owned=element=>element.closest(scopeSelector)===root;
+      const native=[...root.querySelectorAll('input[type="radio"]')].filter(owned).filter(element=>visible(element) || [...(element.labels || [])].some(visible));
+      const aria=[...root.querySelectorAll('[role="radio"]')].filter(element=>owned(element) && element.tagName!=='INPUT' && visible(element));
+      const custom=[...root.querySelectorAll('button')].filter(element=>owned(element) && visible(element) && answer(element.innerText.trim()));
+      const unknown=[...root.querySelectorAll('label,span,div')].filter(element=>owned(element) && visible(element) && answer(element.innerText.trim()) && ![...element.children].some(child=>answer(child.innerText?.trim() || '')));
+      const sets=native.length?[...new Set(native.map(element=>element.name))].map(name=>({kind:'native',elements:native.filter(element=>element.name===name)}))
+        :aria.length?[{kind:'aria',elements:aria}]:custom.length?[{kind:'custom',elements:custom}]:unknown.length?[{kind:'unknown',elements:unknown}]:[];
+      return sets.flatMap(({kind,elements})=>{
+        const options=elements.map(element=>option(root,element,kind));
+        if(!options.some(item=>item.value))return [];
+        const labelled=(root.getAttribute('aria-labelledby') || '').split(/\s+/).map(id=>document.getElementById(id)).filter(element=>element && visible(element)).map(element=>element.innerText.trim()).join(' ');
+        const heading=[...root.querySelectorAll('legend,h1,h2,h3,h4')].find(element=>owned(element) && visible(element));
+        const directTitle=[...root.children].find(element=>visible(element) && !element.matches('button,input,[role="radio"]') && !element.querySelector('button,input,[role="radio"]') && element.innerText.trim());
+        const question=(root.getAttribute('aria-label') || labelled || heading?.innerText || directTitle?.innerText || '').trim();
+        const required=root.getAttribute('aria-required')==='true' || elements.some(element=>element.required || element.getAttribute('aria-required')==='true') || /\*|必填|\bRequired\b|필수/i.test(question);
+        return [{question,required,kind:kind==='native' && !elements[0].name?'unknown':kind,scopeIndex,scopeText:root.innerText.trim(),options}];
+      });
+    });
+  })():[];
+  const requiredChoiceFields=choiceGroups.filter(group=>group.required && (group.options.some(option=>typeof option.selected!=='boolean') || group.options.filter(option=>option.selected).length!==1)).map(group=>group.question || '必填是／否问题');
+  const missingRequired=[...document.querySelectorAll('input[required],textarea[required],select[required],[aria-required="true"]')].filter(visible).filter(element=>{
+    if(element.matches('input[type="radio"]'))return ![...document.querySelectorAll('input[type="radio"]')].some(other=>other.form===element.form && other.name===element.name && other.checked);
+    if(element.matches('[role="radiogroup"]'))return [...element.querySelectorAll('[role="radio"][aria-checked="true"]')].filter(visible).length!==1;
+    if(element.matches('[role="radio"]'))return element.closest('[role="radiogroup"]')?.querySelectorAll('[role="radio"][aria-checked="true"]').length!==1;
+    return !element.value?.trim();
+  }).map(element=>names.includes(element)?'预约姓名':element.getAttribute('aria-label') || element.name || '必填信息');
   for(const name of names)if(!name.value?.trim() && /\*\s*(?:必填|Required|필수)/i.test(name.closest('section')?.querySelector('h3')?.innerText || ''))missingRequired.push('预约姓名');
   if(phoneRequired && !phone.value?.trim())missingRequired.push('电话号码');
+  missingRequired.push(...requiredChoiceFields);
   return {url:location.href,text:text.slice(0,40000),buttons:buttons(document),
     headings:[...document.querySelectorAll('h1,h2,h3,h4')].filter(visible).map(element=>element.innerText.trim()),
     summaries:[...document.querySelectorAll('main p')].filter(visible).map(element=>element.innerText.trim()).filter(value=>value.includes(' · ') && /\d{1,2}:\d{2}/.test(value)),
     links:[...document.querySelectorAll('a[href]')].filter(visible).map(element=>({href:element.href,text:element.innerText.trim()})),
-    dialogs:dialogRoots.map(element=>({text:element.innerText,buttons:buttons(element)})),
+    dialogs:dialogRoots.map(element=>({text:element.innerText,buttons:buttons(element)})),restaurantNotices,
     loading:Boolean([...document.querySelectorAll('[aria-busy="true"], [role="progressbar"]')].find(visible)),
     captcha:Boolean([...document.querySelectorAll('iframe[src*="captcha"], [id*="captcha"]')].find(visible)),
     uncheckedAgreements:unchecked.filter(element=>!/(?:不再显示|Don't show again|Do not show again)/i.test(labels(element))).map(labels),
-    missingRequiredFields:missingRequired,
+    missingRequiredFields:[...new Set(missingRequired)],choiceGroups,requiredChoiceFields,
     nameFields:names.map(element=>({index:inputs.indexOf(element),empty:!element.value?.trim(),readOnly:Boolean(element.readOnly),disabled:Boolean(element.disabled)})),
     phoneField:phone?{required:phoneRequired,empty:!phone.value?.trim(),countryCode:phone.previousElementSibling?.innerText.trim() || ''}:null,
     cards:[...document.querySelectorAll('a[href*="/customer/reservation/detail/"]')].filter(visible).map(element=>({url:element.href,text:element.innerText,headings:[...element.querySelectorAll('h1,h2,h3,h4,h5')].map(heading=>heading.innerText.trim())}))};

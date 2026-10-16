@@ -124,6 +124,38 @@ test('account pause and disable affect only their runtime while global pause rem
   assert.equal(c.engine('default').state().paused, true);
 }));
 
+test('identity replacement requires confirmation and returns the completed fresh paused account rather than a pending promise', () => fixture(async ({ post, store, c, addAccount, addTask }) => {
+  const account=await addAccount({bookingName:'Old HTTP name',bookingPhoneCountryCode:'+1',bookingPhoneNumber:'2025550101',bookingPhoneAutoFill:true});
+  const task=await addTask(account.id),scoped=store.forAccount(account.id),oldEngine=c.engine(account.id);
+  store.bindAccountIdentity(account.id,'old-http-lifecycle-identity');
+  scoped.patchTask(task.id,{status:'active',nextCheckAt:new Date(NOW).toISOString(),slots:[slot]},new Date(NOW).toISOString());
+  for(const confirm of [undefined,false,'true'])assert.equal((await post(`/api/accounts/${account.id}/action`,{action:'reset_identity',confirm})).status,400);
+  const response=await post(`/api/accounts/${account.id}/action`,{action:'reset_identity',confirm:true});
+  assert.equal(response.status,200);assert.equal(response.json.account.id,account.id);assert.equal(response.json.account.enabled,true);
+  assert.equal(response.json.account.settings.enginePaused,true);assert.equal(response.json.account.settings.bookingPhoneAutoFill,false);assert.equal(response.json.account.settings.bookingName,'');
+  assert.notEqual(c.engine(account.id),oldEngine);assert.equal(store.getAccount(account.id).identityFingerprint,null);
+  assert.equal(scoped.getTask(task.id).status,'paused');assert.deepEqual(scoped.getTask(task.id).slots,[]);
+  assert.equal(JSON.stringify(response.json).includes('old-http-lifecycle-identity'),false);
+}));
+
+test('account deletion rejects default and unresolved bookings, then hides its tasks while preserving labeled all-account history', () => fixture(async ({ send, post, store, addAccount, addTask, origin }) => {
+  const account=await addAccount(),task=await addTask(account.id),scoped=store.forAccount(account.id);
+  const attempt=scoped.addAttempt(task,slot,'outcome_unknown','Pending HTTP lifecycle fixture',new Date(NOW).toISOString());
+  assert.equal((await post('/api/accounts/default/action',{action:'delete',confirm:true})).status,409);
+  assert.equal((await post(`/api/accounts/${account.id}/action`,{action:'delete'})).status,400);
+  for(const action of ['reset_identity','delete'])assert.equal((await post(`/api/accounts/${account.id}/action`,{action,confirm:true})).status,409);
+  scoped.saveAttempt({...attempt,status:'rejected'});
+  const response=await post(`/api/accounts/${account.id}/action`,{action:'delete',confirm:true});
+  assert.equal(response.status,200);assert.deepEqual(response.json,{ok:true,accountId:account.id,deleted:true});
+  assert.equal((await post(`/api/accounts/${account.id}/action`,{action:'enable'})).status,404);
+  assert.equal((await post(`/api/accounts/${account.id}/session/check`,{})).status,404);
+  assert.equal((await send(`/api/accounts/${account.id}/pairing`,{headers:{origin,'sec-fetch-site':'same-origin'}})).status,404);
+  const state=(await send('/api/state')).json;
+  assert.deepEqual(state.accounts.map(value=>value.id),['default']);assert.deepEqual(state.tasks,[]);
+  assert.ok(state.bookings.some(booking=>booking.id===attempt.id && booking.accountLabel===account.label && booking.accountArchived===true));
+  assert.equal(scoped.getAttempt(attempt.id).id,attempt.id);assert.equal((await send(`/api/state?accountId=${account.id}`)).status,404);
+}));
+
 test('account pairing codes require the existing same-origin read guard and never enter normal state', () => fixture(async ({ send, origin, addAccount }) => {
   const second = await addAccount();
   const path = `/api/accounts/${second.id}/pairing`;

@@ -89,3 +89,17 @@ test('stop waits for outstanding page cleanup before closing the adapter',async(
     release();await stopping;assert.equal(closed,true);
   }finally {release();await f.close();}
 });
+
+test('an API rate limit honors its retry delay and preserves the last valid inventory',async()=>{
+  const f=fixture({inspect:async()=>({status:'unknown',slots:[],retryAfterMs:30000,message:'官网限制了访问频率，稍后重试。'})});
+  try {
+    const task=f.task({slots:[slot]});
+    await f.engine.checkTask(task.id);
+    const updated=f.store.getTask(task.id);
+    assert.equal(updated.status,'backoff');
+    assert.equal(updated.lastObservationStatus,'unknown');
+    assert.equal(Date.parse(updated.nextCheckAt)-INITIAL,30000);
+    assert.deepEqual(updated.slots,[slot]);
+    assert.equal(f.store.listNotifications().some(notice=>notice.eventType==='slot_available'),false);
+  }finally {await f.close();}
+});
